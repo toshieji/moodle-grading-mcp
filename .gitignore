@@ -1,0 +1,15 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+client_secret.json
+token.json
+
+# logs (incl. audit.log / grade.log)
+*.log
+
+# environment
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
