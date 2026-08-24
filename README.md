@@ -26,6 +26,7 @@ An MCP server (stdio) that exposes **Moodle Web Services** as grading I/O tools.
 In Moodle: enable Web Services, then issue a token for a user with grading permission (Site administration → Server → Web services → Manage tokens). The token needs the functions used here: `core_webservice_get_site_info`, `core_course_get_courses_by_field`, `core_course_get_contents`, `mod_assign_get_assignments`, `mod_assign_get_submissions`, `mod_assign_get_grades`, `mod_assign_get_submission_status`, `mod_assign_save_grade`.
 
 ### 2. `.env`
+Place `.env` in the **parent directory of `server.py`** (the code loads `../.env`), or export the variables in your shell.
 ```sh
 MOODLE_URL="https://moodle.example.com"
 MOODLE_TOKEN="<your token>"
@@ -63,6 +64,9 @@ For HTTP exposure: `MCP_TRANSPORT=streamable-http` + `MCP_BEARER_TOKENS=...` (+ 
 ## Secrets (never commit)
 `.env` and `*.log` (incl. `audit.log`) are git-ignored. Never commit your Moodle token.
 
+## Operations manual
+A step-by-step Japanese manual for non-engineer operators (setup, day-to-day use, what the server can and cannot do, safety rules, troubleshooting): [`docs/OPERATIONS-ja.md`](docs/OPERATIONS-ja.md).
+
 ## License
 MIT License (see `LICENSE`).
 
@@ -96,6 +100,7 @@ MIT License (see `LICENSE`).
 Moodle で Web Services を有効化し、採点権限を持つユーザのトークンを発行（サイト管理 → サーバー → Web サービス → トークンの管理）。上記ツールが使う WS 関数を許可してください。
 
 ### 2. `.env`
+`.env` は **`server.py` の 1 つ上の階層**に置きます（コードは `../.env` を読み込みます）。シェルで `export` しても構いません。
 ```sh
 MOODLE_URL="https://moodle.example.com"
 MOODLE_TOKEN="<トークン>"
@@ -123,6 +128,9 @@ HTTP 公開: `MCP_TRANSPORT=streamable-http` + `MCP_BEARER_TOKENS=...`。OAuth �
 
 ## 秘密情報（コミットしない）
 `.env` と `*.log`（`audit.log` 含む）は `.gitignore` 済み。トークンは絶対にコミットしないこと。
+
+## 運用マニュアル
+エンジニア以外の運用担当者向けの手順書（導入・日常の使い方・できること/できないこと・安全規則・トラブルシューティング）: [`docs/OPERATIONS-ja.md`](docs/OPERATIONS-ja.md)
 
 ## ライセンス
 MIT License（`LICENSE` 参照）。

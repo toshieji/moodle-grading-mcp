@@ -15,7 +15,7 @@ server-side:
   - 監査ログ: save_grade_draft を JSONL で MOODLE_AUDIT_LOG（既定 mcp/audit.log）へ追記。
   - ログ: stdout は JSON-RPC のため汚さない。サーバログは stderr、クライアントへは MCP logging 通知。
 
-.env (place next to this file, or export):
+.env (place in the PARENT directory of this file — the code loads ../.env — or export):
   MOODLE_URL="https://moodle.example.com"
   MOODLE_TOKEN="<token of a user with grading permission>"
   MOODLE_ALLOW_WRITE=0                       # 1 to enable writes
