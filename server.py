@@ -21,8 +21,12 @@ server-side:
   MOODLE_ALLOW_WRITE=0                       # 1 to enable writes
   MOODLE_WRITE_COURSE_ALLOWLIST=            # comma-separated course IDs allowed to write (empty=none)
   MOODLE_AI_FOOTER_FILE=                    # optional: path to a custom disclosure footer (HTML)
+  MOODLE_MAX_FILE_MB=150                    # 提出ファイル1件の取得上限(MB)
+  MOODLE_MAX_TEXT_CHARS=800000              # 抽出テキストの上限(文字)
+  MOODLE_MAX_IMAGES=20                      # 1回に返す画像の上限(枚)
+  MOODLE_IMAGE_MAX_PX=1568                  # 画像の長辺上限(px)。超えたら縮小
 
-依存: mcp, httpx, python-dotenv
+依存: mcp(<2), httpx, python-dotenv, python-docx, python-pptx, openpyxl, pypdf, pillow
 起動（stdio）: python server.py / 起動（HTTP）: MCP_TRANSPORT=streamable-http ... python server.py
 """
 from __future__ import annotations
@@ -37,9 +41,13 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:  # extract.py を server.py の隣から確実に読む
+    sys.path.insert(0, _HERE)
+import extract  # noqa: E402  (sys.path 調整後に読む必要がある)
+
 # .env は moodle ディレクトリ直下（mcp の一つ上）
 load_dotenv(os.path.join(_HERE, "..", ".env"))
 
@@ -53,6 +61,13 @@ WRITE_COURSES = {
 }
 ENDPOINT = f"{MOODLE_URL}/webservice/rest/server.php"
 AUDIT_PATH = os.environ.get("MOODLE_AUDIT_LOG", os.path.join(_HERE, "audit.log"))
+
+# 提出ファイルの取得上限。修了レポートの pptx は数十MBになるため既定は大きめ。
+MAX_FILE_MB = int(os.environ.get("MOODLE_MAX_FILE_MB", "150"))
+MAX_TEXT_CHARS = int(os.environ.get("MOODLE_MAX_TEXT_CHARS", "800000"))
+MAX_IMAGES = int(os.environ.get("MOODLE_MAX_IMAGES", "20"))
+IMAGE_MAX_PX = int(os.environ.get("MOODLE_IMAGE_MAX_PX", "1568"))
+DOWNLOAD_TIMEOUT = float(os.environ.get("MOODLE_DOWNLOAD_TIMEOUT", "180"))
 
 # AI開示フッター。MOODLE_AI_FOOTER_FILE（HTMLファイル）で全文を差し替え可能。
 # 検出マークは MOODLE_AI_FOOTER_MARK で上書き可（フッター文面に必ず含める語にすること）。
@@ -342,12 +357,11 @@ async def list_pending(assignid: int, ctx: Context = None) -> list[dict]:
     return pending
 
 
-@mcp.tool()
-async def get_submission(assignid: int, userid: int, ctx: Context = None) -> dict:
-    """指定ユーザの提出内容を返す。返り値: {onlinetext, files:[name], status, gradingstatus}。
+def _submission_parts(assignid: int, userid: int) -> dict:
+    """提出の生データを整形して返す（onlinetext と添付ファイルのメタデータ）。
 
-    返り値の onlinetext（オンラインテキスト提出）と files（添付ファイル名）を採点対象に使う
-    （配点・ルーブリックは運用側の採点プロンプトで定義する）。
+    添付は filename だけでなく fileurl / mimetype / filesize も保持する。fileurl が無いと
+    本文を取りに行けないため（以前はここで捨てていた）。
     """
     st = _call(
         "mod_assign_get_submission_status", {"assignid": assignid, "userid": userid}
@@ -355,7 +369,7 @@ async def get_submission(assignid: int, userid: int, ctx: Context = None) -> dic
     last = st.get("lastattempt", {}) or {}
     submission = last.get("submission", {}) or last.get("teamsubmission", {}) or {}
     onlinetext = ""
-    files: list[str] = []
+    files: list[dict] = []
     for p in submission.get("plugins", []):
         if p.get("type") == "onlinetext":
             for ef in p.get("editorfields", []):
@@ -363,14 +377,156 @@ async def get_submission(assignid: int, userid: int, ctx: Context = None) -> dic
         if p.get("type") == "file":
             for fa in p.get("fileareas", []):
                 for f in fa.get("files", []):
-                    files.append(f.get("filename", ""))
-    await _safe_log(ctx, "info", f"get_submission assign={assignid} user={userid} files={len(files)}")
+                    files.append(
+                        {
+                            "filename": f.get("filename", ""),
+                            "fileurl": f.get("fileurl", ""),
+                            "mimetype": f.get("mimetype", ""),
+                            "filesize": f.get("filesize", 0) or 0,
+                        }
+                    )
     return {
         "status": submission.get("status"),
         "gradingstatus": last.get("gradingstatus"),
         "onlinetext": onlinetext,
         "files": files,
     }
+
+
+def _pick_files(files: list[dict], filename: str) -> list[dict]:
+    if not filename:
+        return files
+    hit = [f for f in files if f["filename"] == filename]
+    if not hit:
+        names = ", ".join(f["filename"] for f in files) or "(添付なし)"
+        raise RuntimeError(f"'{filename}' は提出物にありません。添付: {names}")
+    return hit
+
+
+def _download(f: dict) -> bytes:
+    """添付ファイルの実体を取得する。URL にトークンを付けるため、URL は絶対にログへ出さない。"""
+    url = f.get("fileurl") or ""
+    if not url:
+        raise RuntimeError(f"{f.get('filename')}: fileurl がありません")
+    size = int(f.get("filesize") or 0)
+    if size and size > MAX_FILE_MB * 1024 * 1024:
+        raise RuntimeError(
+            f"{f['filename']}: {size / 1048576:.1f}MB は上限 {MAX_FILE_MB}MB を超えます"
+            "（MOODLE_MAX_FILE_MB で変更可）"
+        )
+    sep = "&" if "?" in url else "?"
+    r = httpx.get(f"{url}{sep}token={MOODLE_TOKEN}", timeout=DOWNLOAD_TIMEOUT, follow_redirects=True)
+    r.raise_for_status()
+    body = r.content
+    # Moodle は認証失敗も HTTP 200 + JSON で返すことがある
+    if body[:1] == b"{" and b"exception" in body[:400]:
+        raise RuntimeError(f"{f['filename']}: ダウンロードに失敗しました（トークン権限を確認してください）")
+    if len(body) > MAX_FILE_MB * 1024 * 1024:
+        raise RuntimeError(f"{f['filename']}: 取得サイズが上限 {MAX_FILE_MB}MB を超えました")
+    return body
+
+
+@mcp.tool()
+async def get_submission(assignid: int, userid: int, ctx: Context = None) -> dict:
+    """指定ユーザの提出内容を返す。返り値: {status, gradingstatus, onlinetext, files:[...]}。
+
+    files は [{filename, fileurl, mimetype, filesize}]。**本文は含まれない**（一覧のみ）。
+    添付の中身は read_submission_file（本文）／ read_submission_images（図・画像）で取得する。
+    ほとんどの課題は本文が添付ファイル側にあるため、onlinetext だけで採点しないこと。
+    """
+    parts = _submission_parts(assignid, userid)
+    await _safe_log(
+        ctx, "info",
+        f"get_submission assign={assignid} user={userid} files={len(parts['files'])}",
+    )
+    return parts
+
+
+@mcp.tool()
+async def read_submission_file(
+    assignid: int, userid: int, filename: str = "", max_chars: int = 0,
+    ctx: Context = None,
+) -> dict:
+    """添付ファイルの本文をテキストで返す（docx / pptx / xlsx / pdf / テキスト）。
+
+    filename 省略時は添付すべてを処理する。max_chars 省略時は MOODLE_MAX_TEXT_CHARS。
+    返り値: {files:[{filename, kind, chars, truncated, note, text}]}
+
+    1ファイルの失敗で全体を止めない（note にエラーを入れて続行する）。
+    text が空で note が「画像として貼り付けられている可能性」を示す場合は
+    read_submission_images を使うこと。
+    """
+    parts = _submission_parts(assignid, userid)
+    targets = _pick_files(parts["files"], filename)
+    limit = max_chars if max_chars > 0 else MAX_TEXT_CHARS
+    out: list[dict] = []
+    for f in targets:
+        try:
+            data = _download(f)
+        except Exception as e:
+            out.append({"filename": f["filename"], "kind": "unknown", "text": "",
+                        "chars": 0, "truncated": False, "note": str(e)})
+            continue
+        res = extract.extract_text(data, f["filename"], f.get("mimetype", ""), limit)
+        res["filename"] = f["filename"]
+        out.append(res)
+    await _safe_log(
+        ctx, "info",
+        f"read_submission_file assign={assignid} user={userid} files={len(out)} "
+        f"chars={sum(r['chars'] for r in out)}",
+    )
+    return {"files": out}
+
+
+@mcp.tool()
+async def read_submission_images(
+    assignid: int, userid: int, filename: str = "", limit: int = 0,
+    ctx: Context = None,
+) -> list:
+    """添付に含まれる画像を画像として返す（モデルが見て書き起こす・内容を読み取るため）。
+
+    pptx はスライド番号つき（slide3_img1 など）、pdf はページ番号つきで返すので、
+    「どのページの図か」を採点コメントに書ける。docx / xlsx / 画像ファイルにも対応。
+
+    テキスト抽出では取れない情報（スクリーンショット、ワイヤーフレーム、グラフ、
+    手書き図、画像化された表）を読むために使う。**呼び出し側は、返ってきた画像を見て
+    文字を書き起こし、図の内容を説明すること。** サーバ側では OCR しない。
+
+    filename 省略時は添付すべてが対象。limit 省略時は MOODLE_MAX_IMAGES。
+    長辺 MOODLE_IMAGE_MAX_PX を超える画像は縮小する（既定 1568px）。
+    """
+    parts = _submission_parts(assignid, userid)
+    targets = _pick_files(parts["files"], filename)
+    cap = limit if limit > 0 else MAX_IMAGES
+    blocks: list = []
+    notes: list[str] = []
+    remaining = cap
+    for f in targets:
+        if remaining <= 0:
+            notes.append(f"{f['filename']}: 上限{cap}枚に達したため未処理")
+            continue
+        try:
+            data = _download(f)
+        except Exception as e:
+            notes.append(f"{f['filename']}: {e}")
+            continue
+        images, note = extract.extract_images(
+            data, f["filename"], f.get("mimetype", ""), remaining, IMAGE_MAX_PX
+        )
+        if note:
+            notes.append(f"{f['filename']}: {note}")
+        for img in images:
+            blocks.append(f"[{f['filename']} / {img['name']}]")
+            blocks.append(Image(data=img["data"], format=img["format"]))
+            remaining -= 1
+    header = f"画像 {len(blocks) // 2} 枚。文字を書き起こし、図の内容を説明してください。"
+    if notes:
+        header += " 注記: " + " / ".join(notes)
+    await _safe_log(
+        ctx, "info",
+        f"read_submission_images assign={assignid} user={userid} images={len(blocks) // 2}",
+    )
+    return [header, *blocks]
 
 
 @mcp.tool()
