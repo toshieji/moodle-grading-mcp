@@ -146,6 +146,22 @@ def test_main_skips_unreadable() -> None:
     check(saved == [2], "読めない提出（user 1）は保存されず、読める提出（user 2）だけ保存される")
     check(len(graded_calls) == 1, "読めない提出は採点モデルを呼ばない")
 
+    # 再採点の指定: 採点済み（pending に出ない）user 3 を指定すると採点し直す。指定外の課題は触らない
+    subs[3] = subs[2]
+    saved.clear()
+    patches["list_pending"] = lambda aid: []
+    orig_targets = gj.REGRADE_TARGETS
+    gj.REGRADE_TARGETS = {(10, 3), (99, 4)}
+    for k, v in patches.items():
+        setattr(gj, k, v)
+    try:
+        gj.main()
+    finally:
+        gj.REGRADE_TARGETS = orig_targets
+        for k, v in originals.items():
+            setattr(gj, k, v)
+    check(saved == [3], "REGRADE_TARGETS で指定した採点済みの提出だけを採点し直す")
+
 
 if __name__ == "__main__":
     test_extract()

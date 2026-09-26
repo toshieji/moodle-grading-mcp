@@ -64,6 +64,12 @@ MAX_GRADE_PER_RUN = int(os.environ.get("MAX_GRADE_PER_RUN", "30"))  # 暴走防�
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "12000"))
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(20 * 1024 * 1024)))
 MAX_FILE_TEXT_CHARS = int(os.environ.get("MAX_FILE_TEXT_CHARS", "40000"))
+# 採点済みでも採点し直す提出（"assignid:userid,assignid:userid"）。不具合で誤採点された分の
+# やり直し用。通常の定時実行では空にしておく（gcloud run jobs execute --update-env-vars で1回だけ渡す）。
+REGRADE_TARGETS = {
+    (int(a), int(u)) for a, u in
+    (t.strip().split(":", 1) for t in os.environ.get("REGRADE_TARGETS", "").split(",") if ":" in t)
+}
 # 1提出あたりモデルに渡す画像の上限（図・スクリーンショット。コストと入力上限のため）
 MAX_IMAGES_PER_SUBMISSION = int(os.environ.get("MAX_IMAGES_PER_SUBMISSION", "20"))
 
@@ -860,6 +866,11 @@ def main() -> None:
             except Exception as e:
                 log.error("list_pending failed course=%s assign=%s(%s): %s", course_id, a["id"], a["name"], e)
                 continue
+            forced = sorted(u for aid, u in REGRADE_TARGETS
+                            if aid == a["id"] and u not in {p["userid"] for p in pending})
+            if forced:
+                log.info("  再採点の指定: assign=%s user=%s", a["id"], forced)
+                pending = pending + [{"userid": u} for u in forced]
             # FIX: pending 件数をログに出力して可視化
             log.info("処理中: course=%s assign=%s(%s) pending=%d件（残枠%d）", course_id, a["id"], a["name"],
                      len(pending), MAX_GRADE_PER_RUN - graded)
