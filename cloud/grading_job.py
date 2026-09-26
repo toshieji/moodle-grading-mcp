@@ -73,9 +73,11 @@ REGRADE_TARGETS = {
 # 1提出あたりモデルに渡す画像の上限（図・スクリーンショット。コストと入力上限のため）
 MAX_IMAGES_PER_SUBMISSION = int(os.environ.get("MAX_IMAGES_PER_SUBMISSION", "20"))
 
-# 講評の長さ上限（2026-08-28 江尻指示）。修了レポートのみ長めに許容する。
-FEEDBACK_MAX_CHARS = int(os.environ.get("FEEDBACK_MAX_CHARS", "400"))
-FEEDBACK_MAX_CHARS_FINAL = int(os.environ.get("FEEDBACK_MAX_CHARS_FINAL", "1000"))
+# 講評の長さ上限。修了レポートのみ長めに許容する。Moodle 側の上限ではなく運用上の目安。
+# 2026-08-28 江尻指示で 400/1000 としたが、実際の講評は 750〜1100 字になり毎回書き直し
+# （1件約10分・API費用が倍）になっていたため、2026-09-26 江尻指示で 1500/3000 に緩めた。
+FEEDBACK_MAX_CHARS = int(os.environ.get("FEEDBACK_MAX_CHARS", "1500"))
+FEEDBACK_MAX_CHARS_FINAL = int(os.environ.get("FEEDBACK_MAX_CHARS_FINAL", "3000"))
 FINAL_REPORT_KEYWORD = os.environ.get("FINAL_REPORT_KEYWORD", "修了レポート")
 
 
