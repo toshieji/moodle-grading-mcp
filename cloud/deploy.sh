@@ -87,7 +87,7 @@ gcloud run jobs deploy "$JOB_NAME" \
   --service-account "$SA_EMAIL" \
   --env-vars-file "$ENV_FILE" \
   --set-secrets "MOODLE_TOKEN=moodle-grading-token:latest,ANTHROPIC_API_KEY=anthropic-api-key:latest" \
-  --max-retries 1 --task-timeout 30m --cpu 1 --memory 512Mi
+  --max-retries 0 --task-timeout 3h --cpu 1 --memory 512Mi
 
 echo "== 6. Scheduler 用サービスアカウントに Cloud Run 起動権限を付与 =="
 gcloud projects add-iam-policy-binding "$PROJECT" \
