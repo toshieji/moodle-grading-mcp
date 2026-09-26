@@ -5,6 +5,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY grading_job.py .
+# 提出ファイルの本文・画像抽出（リポジトリ直下の extract.py。deploy.sh がビルド前に同梱する）
+COPY extract.py .
 COPY ai-usage-log-rubric.md .
 
 ENTRYPOINT ["python", "grading_job.py"]

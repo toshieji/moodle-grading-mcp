@@ -18,6 +18,7 @@ Cloud Scheduler → Cloud Run Jobs（このイメージ）を毎朝起動。1回
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -26,6 +27,13 @@ import sys
 from typing import Any
 
 import httpx
+
+# extract.py はリポジトリ直下（MCP サーバと共用）。イメージ内では /app に同梱する。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (_HERE, os.path.dirname(_HERE)):
+    if os.path.exists(os.path.join(_p, "extract.py")) and _p not in sys.path:
+        sys.path.insert(0, _p)
+import extract  # noqa: E402
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), stream=sys.stdout,
                      format="%(asctime)s grading-job %(levelname)s %(message)s")
@@ -56,6 +64,8 @@ MAX_GRADE_PER_RUN = int(os.environ.get("MAX_GRADE_PER_RUN", "30"))  # 暴走防�
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "12000"))
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(20 * 1024 * 1024)))
 MAX_FILE_TEXT_CHARS = int(os.environ.get("MAX_FILE_TEXT_CHARS", "40000"))
+# 1提出あたりモデルに渡す画像の上限（図・スクリーンショット。コストと入力上限のため）
+MAX_IMAGES_PER_SUBMISSION = int(os.environ.get("MAX_IMAGES_PER_SUBMISSION", "20"))
 
 # 講評の長さ上限（2026-08-28 江尻指示）。修了レポートのみ長めに許容する。
 FEEDBACK_MAX_CHARS = int(os.environ.get("FEEDBACK_MAX_CHARS", "400"))
@@ -190,79 +200,65 @@ def _download_file(fileurl: str) -> bytes:
     return r.content
 
 
-def _text_from_docx(blob: bytes) -> str:
-    import io
-    import zipfile
-    from xml.etree import ElementTree as ET
-    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-        root = ET.fromstring(z.read("word/document.xml"))
-    lines = []
-    for p in root.iter(f"{ns}p"):
-        text = "".join(t.text or "" for t in p.iter(f"{ns}t")).strip()
-        if text:
-            lines.append(text)
-    return "\n".join(lines)
+# FIX(2026-09-26): 独自の抽出器は .docx/.pdf/.xlsx しか読めず、pptx で提出された回答本体を
+#   「読めなかった」として扱い、厳格採点の指示と重なって0点近くになっていた。
+#   MCP サーバと同じ extract.py（pptx・表・ノート・埋め込み画像に対応、単体テストあり）に統一する。
+def extract_submitted_files(files: list[dict]) -> tuple[str, list[str], list[dict]]:
+    """提出ファイルの本文と画像を抽出する。
 
-
-def _text_from_pdf(blob: bytes) -> str:
-    import io
-    from pypdf import PdfReader
-    return "\n".join((page.extract_text() or "") for page in PdfReader(io.BytesIO(blob)).pages)
-
-
-def _text_from_xlsx(blob: bytes) -> str:
-    import io
-    import openpyxl
-    wb = openpyxl.load_workbook(io.BytesIO(blob), read_only=True, data_only=True)
-    out = []
-    for ws in wb.worksheets:
-        out.append(f"# シート: {ws.title}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) for c in row if c not in (None, "")]
-            if cells:
-                out.append(" | ".join(cells))
-    return "\n".join(out)
-
-
-_EXTRACTORS = {".docx": _text_from_docx, ".pdf": _text_from_pdf, ".xlsx": _text_from_xlsx}
-_PLAIN_EXT = {".txt", ".md", ".csv", ".json"}
-
-
-def extract_submitted_files(files: list[dict]) -> tuple[str, list[str]]:
-    """提出ファイルの本文を抽出する。戻り値は (本文, 読めなかったファイルの説明)。"""
-    chunks, unreadable = [], []
+    戻り値は (本文, 読めなかったファイルの説明, 画像[{label, data, format}])。
+    図・スクリーンショットだけで構成されたスライドも採点できるよう、埋め込み画像も返す。
+    """
+    chunks: list[str] = []
+    unreadable: list[str] = []
+    images: list[dict] = []
     for f in files:
         name = f.get("filename") or ""
         url = f.get("fileurl") or ""
         size = int(f.get("filesize") or 0)
-        ext = os.path.splitext(name)[1].lower()
+        mimetype = f.get("mimetype") or ""
+        kind = extract.sniff(name, mimetype)
         if not url:
             unreadable.append(f"{name}（URLなし）")
             continue
         if size > MAX_FILE_BYTES:
             unreadable.append(f"{name}（{size}バイトで上限超過）")
             continue
-        if ext not in _EXTRACTORS and ext not in _PLAIN_EXT:
-            unreadable.append(f"{name}（未対応の形式 {ext or '不明'}）")
+        if kind == "unknown":
+            unreadable.append(f"{name}（未対応の形式 {os.path.splitext(name)[1] or '不明'}）")
             continue
         try:
             blob = _download_file(url)
-            if ext in _PLAIN_EXT:
-                text = blob.decode("utf-8", errors="replace")
-            else:
-                text = _EXTRACTORS[ext](blob)
         except Exception as e:
-            unreadable.append(f"{name}（抽出失敗: {type(e).__name__}: {e}）")
+            unreadable.append(f"{name}（ダウンロード失敗: {type(e).__name__}: {e}）")
             continue
-        text = (text or "").strip()
-        if not text:
-            unreadable.append(f"{name}（本文を抽出できず。画像のみの可能性）")
+
+        text = ""
+        if kind != "image":
+            res = extract.extract_text(blob, name, mimetype, max_chars=MAX_FILE_TEXT_CHARS)
+            text = (res["text"] or "").strip()
+            if res["note"].startswith("抽出に失敗"):
+                unreadable.append(f"{name}（{res['note']}）")
+                continue
+            if res["truncated"]:
+                text += "\n…（長すぎるため以降を省略）"
+
+        room = MAX_IMAGES_PER_SUBMISSION - len(images)
+        file_images: list[dict] = []
+        if room > 0:
+            imgs, _ = extract.extract_images(blob, name, mimetype, limit=room)
+            file_images = [{"label": f"{name} / {im['name']}", "data": im["data"],
+                            "format": im["format"]} for im in imgs]
+
+        if not text and not file_images:
+            unreadable.append(f"{name}（本文も画像も取り出せず）")
             continue
-        if len(text) > MAX_FILE_TEXT_CHARS:
-            text = text[:MAX_FILE_TEXT_CHARS] + "\n…（長すぎるため以降を省略）"
-        chunks.append(f"----- ファイル: {name} -----\n{text}")
-    return "\n\n".join(chunks), unreadable
+        images.extend(file_images)
+        if text:
+            chunks.append(f"----- ファイル: {name} -----\n{text}")
+        else:
+            chunks.append(f"----- ファイル: {name} -----\n（テキストなし。画像{len(file_images)}枚を添付）")
+    return "\n\n".join(chunks), unreadable, images
 
 
 def get_submission(assignid: int, userid: int) -> dict:
@@ -279,12 +275,14 @@ def get_submission(assignid: int, userid: int) -> dict:
                 for f in fa.get("files", []):
                     files.append({"filename": f.get("filename", ""),
                                   "fileurl": f.get("fileurl", ""),
-                                  "filesize": f.get("filesize", 0)})
-    file_text, unreadable = extract_submitted_files(files)
+                                  "filesize": f.get("filesize", 0),
+                                  "mimetype": f.get("mimetype", "")})
+    file_text, unreadable, images = extract_submitted_files(files)
     return {"onlinetext": onlinetext,
             "files": [f["filename"] for f in files],
             "file_text": file_text,
-            "unreadable": unreadable}
+            "unreadable": unreadable,
+            "images": images}
 
 
 def save_grade_draft(assignid: int, userid: int, course_id: str, feedback_html: str,
@@ -465,16 +463,18 @@ def grade_submission(client, rubric_text: str, ai_usage_rubric: str, assignment_
                       onlinetext: str, files: list[str],
                       criteria: list[dict] | None = None,
                       file_text: str = "", unreadable: list[str] | None = None,
-                      feedback_limit: int = FEEDBACK_MAX_CHARS) -> dict:
+                      feedback_limit: int = FEEDBACK_MAX_CHARS,
+                      images: list[dict] | None = None) -> dict:
     """性質の異なる3名で独立採点し、4人目が確定させる。PANEL_MODE=0 で従来の単独採点。"""
     if not PANEL_MODE:
         return _grade_once(client, rubric_text, ai_usage_rubric, assignment_name, onlinetext,
-                           files, criteria, file_text, unreadable, feedback_limit)
+                           files, criteria, file_text, unreadable, feedback_limit, images=images)
     drafts = []
     for name, stance in PANEL:
         try:
             d = _grade_once(client, rubric_text, ai_usage_rubric, assignment_name, onlinetext,
-                            files, criteria, file_text, unreadable, feedback_limit, stance=stance)
+                            files, criteria, file_text, unreadable, feedback_limit, stance=stance,
+                            images=images)
             drafts.append((name, d))
             log.info("  合議 %s: %s", name, _score_digest(d, criteria))
         except Exception as e:
@@ -494,12 +494,25 @@ def _score_digest(d: dict, criteria: list[dict] | None) -> str:
     return str(d.get("grade"))
 
 
+def build_user_content(text: str, images: list[dict] | None) -> str | list[dict]:
+    """画像があれば Anthropic Messages API の image ブロックとして本文の後ろに並べる。"""
+    if not images:
+        return text
+    blocks: list[dict] = [{"type": "text", "text": text}]
+    for im in images:
+        blocks.append({"type": "text", "text": f"[画像: {im['label']}]"})
+        blocks.append({"type": "image", "source": {
+            "type": "base64", "media_type": f"image/{im['format']}",
+            "data": base64.b64encode(im["data"]).decode("ascii")}})
+    return blocks
+
+
 def _grade_once(client, rubric_text: str, ai_usage_rubric: str, assignment_name: str,
                 onlinetext: str, files: list[str],
                 criteria: list[dict] | None = None,
                 file_text: str = "", unreadable: list[str] | None = None,
                 feedback_limit: int = FEEDBACK_MAX_CHARS,
-                stance: str = "") -> dict:
+                stance: str = "", images: list[dict] | None = None) -> dict:
     tool = build_grade_tool(criteria)
     # FIX(江尻指示 2026-08-29): 基準ごとの remark は「減点根拠」であり、講師が判断を追うための欄。
     #   上限を課すと根拠が途中で切れて講師も判断がつかなくなるため、字数制限をかけない。
@@ -592,6 +605,12 @@ def _grade_once(client, rubric_text: str, ai_usage_rubric: str, assignment_name:
                 "読めなかった提出物の内容について推測で加点してはならない。"
                 "その観点は満点にせず、needs_human_review=true とし、"
                 "講評に『ファイルを確認できなかったため講師の確認が必要』と明記すること。\n")
+    images = images or []
+    image_note = ""
+    if images:
+        image_note = (f"提出ファイルに含まれる図・画像を{len(images)}枚、このメッセージの後ろに添付した"
+                      "（各画像の直前に「ファイル名 / 画像名」を記す）。図・表・スクリーンショットの内容も"
+                      "採点根拠にしてよい。画像から読み取った内容を引用するときは、どの画像かを示すこと。\n")
     user = (
         f"課題名: {assignment_name}\n"
         f"=== オンラインテキスト（多くの課題ではAI使用ログ） ===\n"
@@ -599,6 +618,7 @@ def _grade_once(client, rubric_text: str, ai_usage_rubric: str, assignment_name:
         f"=== 提出ファイルの本文（多くの課題では回答本体） ===\n"
         f"{file_text or '(添付ファイルなし、または本文を抽出できませんでした)'}\n\n"
         f"添付ファイル名: {', '.join(files) if files else '(なし)'}\n"
+        f"{image_note}"
         f"{warn}\n"
         "注意: オンラインテキストのAI使用ログは『AIをどう使ったか』の記録であり、"
         "回答本体そのものではない。回答内容の観点は、必ず提出ファイルの本文を根拠に採点し、"
@@ -619,7 +639,7 @@ def _grade_once(client, rubric_text: str, ai_usage_rubric: str, assignment_name:
             # 点数のばらつきは減点方式の明示（システムプロンプト）で抑える。
             model=MODEL, max_tokens=MAX_OUTPUT_TOKENS, system=system,
             tools=[tool], tool_choice={"type": "tool", "name": "submit_grade"},
-            messages=[{"role": "user", "content": user + extra}],
+            messages=[{"role": "user", "content": build_user_content(user + extra, images)}],
         )
         tool_input = None
         for block in resp.content:
@@ -823,6 +843,7 @@ def main() -> None:
     graded = 0
     results = []
     failed: list[dict] = []
+    skipped: list[dict] = []
     for course_id in GRADE_COURSE_IDS:
         try:
             assignments = list_assignments(course_id)
@@ -855,13 +876,24 @@ def main() -> None:
                 userid = p["userid"]
                 try:
                     sub = get_submission(a["id"], userid)
-                    log.info("  提出: オンラインテキスト%d字 / ファイル本文%d字 %s",
+                    log.info("  提出: オンラインテキスト%d字 / ファイル本文%d字 / 画像%d枚 %s",
                              len(sub["onlinetext"] or ""), len(sub["file_text"] or ""),
+                             len(sub["images"]),
                              f"/ 読めず: {sub['unreadable']}" if sub["unreadable"] else "")
+                    # FIX(2026-09-26): 読めない提出ファイルがあるまま採点すると、中身を見ずに
+                    #   減点して0点近くを付けてしまう。採点も保存もせず未採点のまま残し、講師に回す
+                    #   （一時的なダウンロード失敗なら翌日の実行で拾い直される）。
+                    if sub["unreadable"]:
+                        skipped.append({"course": course_id, "assignment": a["id"],
+                                        "userid": userid, "unreadable": sub["unreadable"]})
+                        log.warning("  採点保留（読めない提出ファイルあり・保存しない）: assign=%s(%s) "
+                                    "user=%s %s", a["id"], a["name"], userid, sub["unreadable"])
+                        continue
                     result = grade_submission(client, rubric_text, ai_usage_rubric, a["name"],
                                                sub["onlinetext"], sub["files"], criteria,
                                                sub["file_text"], sub["unreadable"],
-                                               feedback_limit_for(a["name"]))
+                                               feedback_limit_for(a["name"]),
+                                               images=sub["images"])
                     scores = None
                     if criteria:
                         scores = normalize_criteria_scores(result.get("criteria"), criteria)
@@ -897,11 +929,15 @@ def main() -> None:
                     log.error("grading failed course=%s assign=%s(%s) user=%s: %s: %s", course_id,
                               a["id"], a["name"], userid, type(e).__name__, e)
 
-    log.info("完了: 保存%d件 / 失敗%d件。要レビュー: %d件", graded, len(failed),
+    log.info("完了: 保存%d件 / 失敗%d件 / 保留（読めないファイル）%d件。要レビュー: %d件",
+             graded, len(failed), len(skipped),
              sum(1 for r in results if r.get("needs_human_review")))
     if failed:
         log.error("失敗した採点: %s", json.dumps(failed, ensure_ascii=False))
-    print(json.dumps({"graded": graded, "failed": failed, "results": results}, ensure_ascii=False))
+    if skipped:
+        log.warning("講師の採点が必要（読めない提出ファイル）: %s", json.dumps(skipped, ensure_ascii=False))
+    print(json.dumps({"graded": graded, "failed": failed, "skipped": skipped, "results": results},
+                     ensure_ascii=False))
 
 
 if __name__ == "__main__":

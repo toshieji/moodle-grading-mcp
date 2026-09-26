@@ -4,3 +4,7 @@ pypdf>=5.0
 openpyxl>=3.1
 google-api-python-client>=2.140
 google-auth>=2.34
+# extract.py（pptx・docx の表とノート・埋め込み画像）
+python-docx>=1.1
+python-pptx>=0.6.23
+pillow>=10.0

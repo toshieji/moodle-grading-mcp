@@ -59,7 +59,12 @@ echo "== 4. イメージビルド（Cloud Build） =="
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/moodle-grading/grading-job:latest"
 gcloud artifacts repositories describe moodle-grading --project "$PROJECT" --location "$REGION" >/dev/null 2>&1 || \
   gcloud artifacts repositories create moodle-grading --project "$PROJECT" --location "$REGION" --repository-format=docker
-gcloud builds submit "$HERE" --project "$PROJECT" --tag "$IMAGE"
+# extract.py はリポジトリ直下（MCP サーバと共用）にあるため、cloud/ と合わせた一時ディレクトリでビルドする。
+BUILD_DIR="$(mktemp -d)"
+cp "$HERE"/Dockerfile "$HERE"/requirements.txt "$HERE"/grading_job.py "$HERE"/ai-usage-log-rubric.md "$BUILD_DIR"/
+cp "$HERE"/../extract.py "$BUILD_DIR"/
+gcloud builds submit "$BUILD_DIR" --project "$PROJECT" --tag "$IMAGE"
+rm -rf "$BUILD_DIR"
 
 echo "== 5. Cloud Run Job 作成/更新 =="
 # 値にカンマを含む変数（GRADE_COURSE_IDS等）があるため --set-env-vars の単純カンマ区切りは使えない。
