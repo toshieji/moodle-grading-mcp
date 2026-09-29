@@ -112,6 +112,10 @@ def test_validate() -> None:
     ded = [{"item_id": log_item.id, "count": 1, "quote": "プロンプト：", "reason": "出力の記録がありません。"}]
     _, problems = gj.check_result(r, {"deductions": ded, "feedback": {}, "ai_checks": flagged})
     check(not problems, "「該当」と減点が一致していれば問題なし")
+    _, problems = gj.check_result(r, {"deductions": ["r5"], "feedback": {"content": "良い"}, "ai_checks": []})
+    check(bool(problems), "型の崩れた出力は落ちずに問題として返す")
+    text = gj.rubric_prompt(r)
+    check("講師の解釈" in text and "AIの出力の要約" in text, "会話ログの項目に講師の解釈を付けて渡す")
 
 
 def test_render() -> None:

@@ -414,7 +414,7 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                       "description": "評価できる点を2〜3個。1個1論点・1文60字以内・です／ます調"},
         "suggestions": {"type": "array", "items": {"type": "string"},
                         "description": "さらに良くするための提案を0〜2個。減点しない観点はここに書く。"
-                                       "1個1論点・1文60字以内"},
+                                       "改善点だけを書き、褒める内容は strengths に書く。1個1論点・1文60字以内"},
     }
     ai_ids = [i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI]
     return {
@@ -481,6 +481,20 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
     }
 
 
+# 減点項目の解釈（講師の判断）。項目の文言を広く読んで見逃すことがあったため、講師が実際に
+# 減点した判断を項目ごとの注記としてモデルに渡す。キーは項目の文言に含まれる語。
+# 出典: 2026-09-28 講師レビュー（受講生別採点表の「講師AI採点レビュー」「講師評価コメント」）
+ITEM_NOTES = {
+    "会話ログ": "プロンプトとAIの出力の要約の両方が必要。プロンプトだけで、AIが何を出力したかの記録が無ければ該当する。",
+    "外部追加の出所": "主張（例：以前は〜だった、という変化）を裏付ける記録が無い場合、"
+                   "本人が「記録を残していない」と書いている場合も該当する。",
+}
+
+
+def item_note(text: str) -> str:
+    return next((f"（講師の解釈: {n}）" for k, n in ITEM_NOTES.items() if k in text), "")
+
+
 def rubric_prompt(rubric: rb.Rubric) -> str:
     lines = []
     for s in rubric.sections:
@@ -490,7 +504,7 @@ def rubric_prompt(rubric: rb.Rubric) -> str:
             head = f"【{rb.KIND_LABEL[s.kind]}】{s.name}（満点 {s.max:g}点）"
         lines.append(head)
         for i in s.items:
-            lines.append(f"  - [{i.id}] {i.text}　−{rb.unit_of(rubric, i):g}点")
+            lines.append(f"  - [{i.id}] {i.text}　−{rb.unit_of(rubric, i):g}点{item_note(i.text)}")
     return "\n".join(lines)
 
 
@@ -585,6 +599,16 @@ def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], li
     """モデルの出力を検証する。戻り値は (採用する減点, 問題点)。"""
     if result is None:
         return [], ["submit_grade が呼ばれませんでした"]
+    # 型が崩れた出力（配列の要素が文字列など）で落ちないよう、先に形を確かめる
+    for key, typ in (("deductions", list), ("ai_checks", list), ("feedback", dict)):
+        if key in result and not isinstance(result[key], typ):
+            return [], [f"{key} の形式が不正（{type(result[key]).__name__}）"]
+    if any(not isinstance(x, dict) for k in ("deductions", "ai_checks") for x in result.get(k) or []):
+        return [], ["deductions / ai_checks の要素がオブジェクトではない"]
+    for k in (rb.CONTENT, rb.AI):
+        v = (result.get("feedback") or {}).get(k)
+        if v is not None and not isinstance(v, dict):
+            return [], [f"feedback.{k} の形式が不正（{type(v).__name__}）"]
     problems = [f"必須項目が欠落: {k}" for k in ("deductions", "feedback") if k not in result]
     deductions, bad = rb.validate_deductions(rubric, result.get("deductions"))
     problems += bad
