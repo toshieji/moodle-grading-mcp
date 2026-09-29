@@ -122,15 +122,17 @@ def test_main_skips_unreadable() -> None:
             "images": []},
         2: {"onlinetext": "log", "files": ["b.pptx"], "file_text": "本文", "unreadable": [], "images": []},
     }
+    import json
+    tabs = json.load(open(os.path.join(ROOT, "tests", "fixtures", "rubric_260828.json"), encoding="utf-8"))
     patches = {
-        "fetch_rubric_sheet_text": lambda: "rubric",
-        "load_ai_usage_rubric": lambda: "ai rubric",
+        "fetch_rubric_tabs": lambda: tabs,
         "list_assignments": lambda cid: [{"id": 10, "cmid": 20, "name": "事前課題3", "grademax": 30}],
         "list_pending": lambda aid: [{"userid": 1}, {"userid": 2}],
-        "get_guide_criteria": lambda cmid: None,
+        "get_guide_criteria": lambda cmid: [{"id": 1, "name": "内容（15点）", "maxscore": 15},
+                                             {"id": 2, "name": "AI使用ログ（15点）", "maxscore": 15}],
         "get_submission": lambda aid, uid: subs[uid],
         "grade_submission": lambda *a, **k: (graded_calls.append(1) or
-                                             {"grade": 20, "feedback_html": "<p>x</p>",
+                                             {"deductions": [], "feedback": {}, "closing": "",
                                               "confidence": "high", "needs_human_review": False}),
         "save_grade_draft": lambda aid, uid, *a, **k: saved.append(uid),
     }
