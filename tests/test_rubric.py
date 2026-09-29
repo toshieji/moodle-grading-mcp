@@ -99,6 +99,20 @@ def test_validate() -> None:
                                       "feedback": {"content": {"strengths": ["節目平均は9点です"]}}})
     check(any("内部用語" in p for p in problems), "受講生向けの文に内部用語があれば直させる")
 
+    ai_items = [i for i in r.items() if r.section_of(i).kind == rb.AI]
+    log_item = next(i for i in ai_items if "会話ログ" in i.text)
+    all_clear = [{"item_id": i.id, "verdict": "非該当", "evidence": "確認済み"} for i in ai_items]
+    _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear[:-1]})
+    check(any("確認していない項目" in p for p in problems), "AI使用ログの項目を1つでも確認していなければ直させる")
+    _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear})
+    check(not problems, "全項目を確認し、該当なしなら問題なし")
+    flagged = [{**c, "verdict": "該当"} if c["item_id"] == log_item.id else c for c in all_clear]
+    _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": flagged})
+    check(any("一致しない" in p for p in problems), "「該当」としたのに減点していなければ直させる")
+    ded = [{"item_id": log_item.id, "count": 1, "quote": "プロンプト：", "reason": "出力の記録がありません。"}]
+    _, problems = gj.check_result(r, {"deductions": ded, "feedback": {}, "ai_checks": flagged})
+    check(not problems, "「該当」と減点が一致していれば問題なし")
+
 
 def test_render() -> None:
     print("講評の型")

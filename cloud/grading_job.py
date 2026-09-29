@@ -85,6 +85,13 @@ REGRADE_TARGETS = {
 # 1提出あたりモデルに渡す画像の上限（図・スクリーンショット。コストと入力上限のため）
 MAX_IMAGES_PER_SUBMISSION = int(os.environ.get("MAX_IMAGES_PER_SUBMISSION", "20"))
 
+def html_to_text(s: str) -> str:
+    """講評 HTML を改行つきの文字列にする（ログ確認用）。"""
+    s = re.sub(r"<br\s*/?>|</p>|</li>|</div>", "\n", s or "")
+    s = re.sub(r"<li>", "・", s)
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
 def _footer() -> str:
     return (
         "<hr><p>──────────<br>"
@@ -409,6 +416,7 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                         "description": "さらに良くするための提案を0〜2個。減点しない観点はここに書く。"
                                        "1個1論点・1文60字以内"},
     }
+    ai_ids = [i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI]
     return {
         "name": "submit_grade",
         "description": "採点表の減点項目に照らした採点結果を返す。点数はシステムが計算する。",
@@ -434,6 +442,22 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                         "required": ["item_id", "count", "reason", "quote", "location"],
                     },
                 },
+                # FIX(2026-09-29): AI使用ログの項目は見落としが出たため（講師が付けた −1 を2件見逃した）、
+                #   全項目について該当／非該当と根拠を返させ、確認を飛ばせないようにする。
+                "ai_checks": {
+                    "type": "array",
+                    "description": "AI使用ログの減点項目すべてについての確認結果。一覧の項目を1つも漏らさず並べる。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "string", "enum": ai_ids},
+                            "verdict": {"type": "string", "enum": ["該当", "非該当"]},
+                            "evidence": {"type": "string",
+                                         "description": "判断の根拠（どの節目・どの記述を確認したか）を1文で"},
+                        },
+                        "required": ["item_id", "verdict", "evidence"],
+                    },
+                },
                 "feedback": {
                     "type": "object",
                     "properties": {rb.CONTENT: {"type": "object", "properties": fb_props},
@@ -451,7 +475,8 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                                    " を、それぞれ改行して書く。",
                 },
             },
-            "required": ["deductions", "feedback", "closing", "confidence", "needs_human_review"],
+            "required": ["deductions", "ai_checks", "feedback", "closing", "confidence",
+                         "needs_human_review"],
         },
     }
 
@@ -515,6 +540,14 @@ def _system(rubric: rb.Rubric, stance: str = "") -> str:
         "- 点数はシステムが計算する。点数や合計を文章に書かない。\n"
         "- 回答内容の項目は提出ファイルの本文を根拠にする。AI使用ログの項目は、オンラインテキストのAI使用ログを根拠にする。\n"
         "- 減点項目への該当判断が割れるとき、機密配慮違反の疑いがあるときは needs_human_review=true にする。\n\n"
+        "【AI使用ログの確認手順（全項目を ai_checks に記録する）】\n"
+        "- 節目（AIを使った作業の区切り）ごとに、次を確認する。\n"
+        "  (a) プロンプトの要約だけでなく、AIの出力の要約も記録されているか（無ければ「会話ログ（要約可）が提出されていない」に該当）\n"
+        "  (b) 外部追加ごとに、いつ・どこで・何にもとづくかが書かれ、その記録で主張を裏付けられるか。"
+        "「以前は〜だった」など変化を主張しているのに、変化前の記録が無い場合は、出所を特定できない外部追加として扱う\n"
+        "  (c) 修正種類の自己申告が、書かれた修正内容と一致しているか\n"
+        "  (d) ログに書かれた修正が、提出物に反映されているか\n"
+        "- ai_checks で「該当」とした項目は、必ず deductions にも入れる。「非該当」とした項目は deductions に入れない。\n\n"
         f"{STYLE_RULES}\n"
         f"=== 採点表「{rubric.tab}」の減点項目（{rubric.key}） ===\n{rubric_prompt(rubric)}\n"
     )
@@ -560,6 +593,15 @@ def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], li
     texts += [t for k in (rb.CONTENT, rb.AI) for f in ("strengths", "suggestions")
               for t in ((fb.get(k) or {}).get(f) or [])]
     texts += [d.get("reason") or "" for d in deductions]
+    ai_ids = {i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI}
+    checks = {str(c.get("item_id")): c.get("verdict") for c in (result.get("ai_checks") or [])}
+    missing = sorted(ai_ids - set(checks))
+    if missing:
+        problems.append(f"ai_checks に確認していない項目がある: {missing}")
+    deducted = {d["item_id"] for d in deductions if d["item_id"] in ai_ids}
+    hit_ids = {k for k, v in checks.items() if v == "該当"}
+    if deducted != hit_ids:
+        problems.append(f"ai_checks の「該当」と deductions が一致しない: 該当={sorted(hit_ids)} 減点={sorted(deducted)}")
     hit = rb.forbidden_in(texts)
     if hit:
         problems.append(f"受講生向けの文に内部用語: {hit}")
@@ -751,6 +793,10 @@ def main() -> None:
                     if result.get("needs_human_review"):
                         log.info("  ❓ 迷いあり: %s",
                                  (result.get("review_reason") or "(理由なし)")[:300])
+                    if not ALLOW_WRITE:
+                        # ドライランのときだけ、保存しない講評を確認用にログへ出す
+                        log.info("  講評（ドライラン・保存しない）:\n%s\n  評定ガイドのコメント: %s",
+                                 html_to_text(fb), [c["remark"] for c in scores])
                     # FIX: 保存前に「採点結果」を出すと、保存で失敗しても成功したように見えるため
                     #      保存が終わってからログを出す。
                     if ALLOW_WRITE:
