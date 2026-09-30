@@ -625,7 +625,9 @@ def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], li
     deducted = {d["item_id"] for d in deductions if d["item_id"] in ai_ids}
     hit_ids = {k for k, v in checks.items() if v == "該当"}
     if deducted != hit_ids:
-        problems.append(f"ai_checks の「該当」と deductions が一致しない: 該当={sorted(hit_ids)} 減点={sorted(deducted)}")
+        problems.append(f"ai_checks で「該当」とした項目 {sorted(hit_ids - deducted)} を deductions に入れていない、"
+                        f"または「非該当」の項目 {sorted(deducted - hit_ids)} を減点している。"
+                        "「該当」と判断した項目は、提出物の引用をつけて deductions に入れること")
     hit = rb.forbidden_in(texts)
     if hit:
         problems.append(f"受講生向けの文に内部用語: {hit}")
@@ -687,11 +689,16 @@ def synthesize(client, rubric: rb.Rubric, drafts: list[tuple[str, dict]], assign
     for name, d in drafts:
         ded = "\n".join(f"  - [{x['item_id']}]×{x['count']} 「{x.get('quote', '')}」 {x.get('reason', '')}"
                         for x in d["deductions"]) or "  （減点なし）"
-        blocks.append(f"--- 採点案{name[0]} ---\n{ded}\n  要確認: {d.get('needs_human_review')}")
+        flagged = "\n".join(f"  - [{c.get('item_id')}] {c.get('evidence', '')}"
+                            for c in (d.get("ai_checks") or []) if isinstance(c, dict) and c.get("verdict") == "該当")
+        blocks.append(f"--- 採点案{name[0]} ---\n{ded}\n"
+                      + (f"  AI使用ログで該当と判断した項目:\n{flagged}\n" if flagged else "")
+                      + f"  要確認: {d.get('needs_human_review')}")
     system = _system(rubric) + (
         "\n【あなたの役割】3名の採点者が独立に付けた減点案を突き合わせ、最終案を1本にまとめる。\n"
         "- 各減点は、引用が本当にその項目に該当するかを提出物で確かめてから採る。人数では決めない。\n"
         "- 1名だけが見つけた減点でも、引用で立証できていれば採る。立証できていなければ採らない。\n"
+        "- 誰か1名でも「該当」と判断した項目は、提出物を読んで該当しないと言い切れない限り減点する（厳しめに採点する）。\n"
         "- 3名の判断が割れ、提出物でも決めきれない減点があれば needs_human_review=true にし、"
         "review_reason に理由を書く。\n"
         "- 評価できる点・改善提案は3案から重複を除いて選び直す。採点者が複数いたことは受講生向けの文に書かない。\n"

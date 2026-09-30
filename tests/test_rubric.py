@@ -108,7 +108,7 @@ def test_validate() -> None:
     check(not problems, "全項目を確認し、該当なしなら問題なし")
     flagged = [{**c, "verdict": "該当"} if c["item_id"] == log_item.id else c for c in all_clear]
     _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": flagged})
-    check(any("一致しない" in p for p in problems), "「該当」としたのに減点していなければ直させる")
+    check(any("deductions に入れていない" in p for p in problems), "「該当」としたのに減点していなければ直させる")
     ded = [{"item_id": log_item.id, "count": 1, "quote": "プロンプト：", "reason": "出力の記録がありません。"}]
     _, problems = gj.check_result(r, {"deductions": ded, "feedback": {}, "ai_checks": flagged})
     check(not problems, "「該当」と減点が一致していれば問題なし")
