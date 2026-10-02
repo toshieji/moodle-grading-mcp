@@ -253,7 +253,7 @@ def render_criterion(rubric: Rubric, kind: str, result: dict, deductions: list[d
     """
     fb = (result.get("feedback") or {}).get(kind) or {}
     out = [f"【{KIND_LABEL[kind]}：{_fmt(scores[kind])}点／{_fmt(grademax)}点】"]
-    good = _lines(fb.get("strengths"))[:3]
+    good = _lines(fb.get("strengths"))[:4]
     if good:
         out += ["", "◎ 評価できる点"] + [f"・{g}" for g in good]
     mine = [d for d in deductions if rubric.section_of(rubric.item(d["item_id"])).kind == kind]
@@ -268,7 +268,7 @@ def render_criterion(rubric: Rubric, kind: str, result: dict, deductions: list[d
         if quote:
             loc = (d.get("location") or "").strip()
             out.append(f"該当箇所{('（' + loc + '）') if loc else ''}：「{quote}」")
-    tips = _lines(fb.get("suggestions"))[:3]
+    tips = _lines(fb.get("suggestions"))[:4]
     if tips:
         out += ["", f"△ {SUGGEST_LABEL}"] + [f"・{t}" for t in tips]
         out.append("※採点基準上の減点事項ではありません。")

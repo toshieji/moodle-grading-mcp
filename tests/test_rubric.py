@@ -104,14 +104,18 @@ def test_validate() -> None:
     all_clear = [{"item_id": i.id, "verdict": "非該当", "evidence": "確認済み"} for i in ai_items]
     _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear[:-1]})
     check(any("確認していない項目" in p for p in problems), "AI使用ログの項目を1つでも確認していなければ直させる")
-    _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear})
+    full_fb = {k: {"strengths": ["良い点です。"], "suggestions": ["改善点です。"]} for k in (rb.CONTENT, rb.AI)}
+    _, problems = gj.check_result(r, {"deductions": [], "feedback": full_fb, "ai_checks": all_clear})
     check(not [p for p in problems if not p.startswith(gj.SOFT)], "全項目を確認し、該当なしなら（長さ以外の）問題なし")
+    _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear})
     check(any(p.startswith(gj.SOFT) for p in problems), "コメントが短ければ書き足させる（長さの問題として区別）")
+    check(any("評価できる点」が空" in p for p in problems) and any("さらに良くするなら」が空" in p for p in problems),
+          "評価できる点・さらに良くするなら が空なら書かせる（必須）")
     flagged = [{**c, "verdict": "該当"} if c["item_id"] == log_item.id else c for c in all_clear]
     _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": flagged})
     check(any("deductions に入れていない" in p for p in problems), "「該当」としたのに減点していなければ直させる")
     ded = [{"item_id": log_item.id, "count": 1, "quote": "プロンプト：", "reason": "出力の記録がありません。"}]
-    _, problems = gj.check_result(r, {"deductions": ded, "feedback": {}, "ai_checks": flagged})
+    _, problems = gj.check_result(r, {"deductions": ded, "feedback": full_fb, "ai_checks": flagged})
     check(not [p for p in problems if not p.startswith(gj.SOFT)], "「該当」と減点が一致していれば（長さ以外の）問題なし")
     _, problems = gj.check_result(r, {"deductions": ["r5"], "feedback": {"content": "良い"}, "ai_checks": []})
     check(bool(problems), "型の崩れた出力は落ちずに問題として返す")

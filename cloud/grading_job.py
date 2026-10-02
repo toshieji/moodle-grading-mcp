@@ -451,12 +451,13 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
     """採点表の減点項目だけを選べるツール定義。項目IDは enum で縛り、表に無い減点を構造的に防ぐ。"""
     fb_props = {
         "strengths": {"type": "array", "items": {"type": "string"},
-                      "description": "評価できる点を3個。提出物のどこが、なぜ良いかを具体的に（引用や箇所を示す）。"
-                                     "1個1論点・2〜3文・です／ます調"},
+                      "description": "評価できる点を3〜4個（必須・1個以上）。提出物のどこが、なぜ良いかを具体的に"
+                                     "（引用や箇所を示す）。1個1論点・3〜4文・です／ます調"},
         "suggestions": {"type": "array", "items": {"type": "string"},
                         "description": "さらに良くするための提案を0〜2個。減点しない観点はここに書く。"
-                                       "改善点だけを書き、褒める内容は strengths に書く。何をどう直すと良いかを具体的に。"
-                                       "1個1論点・2〜3文。2〜3個"},
+                                       "改善点だけを書き、褒める内容は strengths に書く。何をどう直すと良いか、"
+                                       "直すとどう良くなるかまで具体的に。1個1論点・3〜4文。3〜4個（必須・1個以上）。"
+                                       "減点が無い基準でも必ず書く"},
     }
     ai_ids = [i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI]
     return {
@@ -563,7 +564,8 @@ STYLE_RULES = (
     "- です／ます調。1文はなるべく60字以内、1つの箇条は2〜3文。1つの箇条に1つの論点だけを書く。\n"
     "- 講師は、AIの講評から不要な部分を削って使う。足りない説明を講師が書き足すより、削るほうが負担が少ないので、"
     "説明は多めに書く。基準（内容／AI使用ログ）ごとに、評価できる点・減点理由・さらに良くするなら を合わせて"
-    "400〜600字を目安にする。\n"
+    "1,000字前後（900〜1,200字）を目安にする。\n"
+    "- 評価できる点と、さらに良くするなら は、どの基準でも必ず書く（満点の基準でも改善点を書く）。\n"
     "- 受講生が知らない採点の内部用語を使わない（採点者A/B/C、合議、節目平均、内部修正点、"
     "外部追加点、整形明示、ルーブリック、§、項目ID など）。\n"
     "- 提出物を引用するときは「」でくくり、40字以内にする。\n"
@@ -655,7 +657,7 @@ def _call_tool(client, system: str, content, tool: dict) -> tuple[dict | None, s
 
 # 長さの不足は直させるが、直らなくても要確認にはしない（採点の正しさとは別の問題のため）
 SOFT = "[長さ] "
-MIN_COMMENT_CHARS = int(os.environ.get("MIN_COMMENT_CHARS", "300"))
+MIN_COMMENT_CHARS = int(os.environ.get("MIN_COMMENT_CHARS", "800"))
 
 
 def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], list[str]]:
@@ -698,7 +700,10 @@ def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], li
                  if rubric.section_of(rubric.item(d["item_id"])).kind == kind)
         if n < MIN_COMMENT_CHARS:
             problems.append(f"{SOFT}{rb.KIND_LABEL[kind]}のコメントが短い（{n}字）。"
-                            "評価できる点・減点理由・さらに良くするなら を合わせて400〜600字を目安に、具体的に書き足すこと")
+                            "評価できる点・減点理由・さらに良くするなら を合わせて1,000字前後を目安に、具体的に書き足すこと")
+        for k, label in (("strengths", "評価できる点"), ("suggestions", "さらに良くするなら")):
+            if not [t for t in (f.get(k) or []) if isinstance(t, str) and t.strip()]:
+                problems.append(f"{rb.KIND_LABEL[kind]}の「{label}」が空。必ず1個以上書くこと")
     hit = rb.forbidden_in(texts)
     if hit:
         problems.append(f"受講生向けの文に内部用語: {hit}")
