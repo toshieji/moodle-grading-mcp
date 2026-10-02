@@ -19,6 +19,7 @@ Cloud Scheduler → Cloud Run Jobs（このイメージ）を毎朝起動。1回
 from __future__ import annotations
 
 import base64
+import html
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ for _p in (_HERE, os.path.dirname(_HERE)):
     if os.path.exists(os.path.join(_p, "extract.py")) and _p not in sys.path:
         sys.path.insert(0, _p)
 import extract  # noqa: E402
+import rubric as rb  # noqa: E402
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), stream=sys.stdout,
                      format="%(asctime)s grading-job %(levelname)s %(message)s")
@@ -49,7 +51,18 @@ WRITE_COURSES = {c.strip() for c in os.environ.get("MOODLE_WRITE_COURSE_ALLOWLIS
 GRADE_COURSE_IDS = [c.strip() for c in os.environ.get("GRADE_COURSE_IDS", "").split(",") if c.strip()]
 
 RUBRIC_SHEET_ID = os.environ.get("RUBRIC_SHEET_ID", "1bpQvKMMxQtjmn3ruhuVR8UNQAhQuWnMQMIUm21E6zv0")
-RUBRIC_SHEET_GID = os.environ.get("RUBRIC_SHEET_GID", "")  # 対象タブの gid（空なら表紙のみ）
+# FIX(2026-09-29 江尻指示): 採点の根拠は採点表の課題タブに一本化する。
+#   従来は RUBRIC_SHEET_GID の1タブ（本番設定では「表紙」＝配点一覧）しか読んでおらず、
+#   課題ごとの減点項目がモデルに渡っていなかった。これが採点基準外の減点の主因だった。
+#   Moodle の課題名の先頭（事前課題2-1 等）→ 採点表のタブ（と、小計で区切られた範囲）の対応表。
+#   ここに無い課題は採点せず保留する（講師が採点する）。RUBRIC_MAP_JSON で上書き可。
+RUBRIC_MAP: dict[str, dict] = json.loads(os.environ.get("RUBRIC_MAP_JSON") or json.dumps({
+    "事前課題1": {"tab": "事前課題1（上級ウェブ解析士とは）"},
+    "事前課題2-1": {"tab": "事前課題2（事業分析）", "part": "事前課題2-1"},
+    "事前課題2-2": {"tab": "事前課題2（事業分析）", "part": "事前課題2-2"},
+    "事前課題2-3": {"tab": "事前課題2（事業分析）", "part": "事前課題2-3"},
+    "事前課題3": {"tab": "事前課題3（WordPress記事案）"},
+}))
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 MODEL = os.environ.get("GRADING_MODEL", "claude-haiku-4-5-20251001")
@@ -57,7 +70,6 @@ MODEL = os.environ.get("GRADING_MODEL", "claude-haiku-4-5-20251001")
 PANEL_MODE = os.environ.get("GRADING_PANEL", "1") == "1"
 
 _FOOTER_MARK = os.environ.get("MOODLE_AI_FOOTER_MARK", "AI-assisted grading")
-_AI_USAGE_RUBRIC_PATH = os.environ.get("AI_USAGE_RUBRIC_PATH", "/app/ai-usage-log-rubric.md")
 
 MAX_GRADE_PER_RUN = int(os.environ.get("MAX_GRADE_PER_RUN", "30"))  # 暴走防止の上限
 # FIX: 4096 では日本語の講評が入り切らず tool_use が途中で切れていたため引き上げる。
@@ -70,27 +82,20 @@ REGRADE_TARGETS = {
     (int(a), int(u)) for a, u in
     (t.strip().split(":", 1) for t in os.environ.get("REGRADE_TARGETS", "").split(",") if ":" in t)
 }
+# 校正モード（2026-10-03 江尻指示「人の採点を参考に学習する。決して上書きしない」）。
+#   人（AI のトークン以外の採点者）が採点済みの提出を AI でも採点し、点数を比べてログに出すだけ。
+#   このモードでは MOODLE_ALLOW_WRITE に関係なく、Moodle へは一切書き込まない。
+CALIBRATE = os.environ.get("CALIBRATE", "0") == "1"
+if CALIBRATE:
+    ALLOW_WRITE = False
 # 1提出あたりモデルに渡す画像の上限（図・スクリーンショット。コストと入力上限のため）
 MAX_IMAGES_PER_SUBMISSION = int(os.environ.get("MAX_IMAGES_PER_SUBMISSION", "20"))
 
-# 講評の長さ上限。修了レポートのみ長めに許容する。Moodle 側の上限ではなく運用上の目安。
-# 2026-08-28 江尻指示で 400/1000 としたが、実際の講評は 750〜1100 字になり毎回書き直し
-# （1件約10分・API費用が倍）になっていたため、2026-09-26 江尻指示で 4000/6000 に緩めた。
-FEEDBACK_MAX_CHARS = int(os.environ.get("FEEDBACK_MAX_CHARS", "4000"))
-FEEDBACK_MAX_CHARS_FINAL = int(os.environ.get("FEEDBACK_MAX_CHARS_FINAL", "6000"))
-FINAL_REPORT_KEYWORD = os.environ.get("FINAL_REPORT_KEYWORD", "修了レポート")
-
-
-def feedback_limit_for(assignment_name: str) -> int:
-    return FEEDBACK_MAX_CHARS_FINAL if FINAL_REPORT_KEYWORD in (assignment_name or "") \
-        else FEEDBACK_MAX_CHARS
-
-
-def visible_len(html: str) -> int:
-    """タグを除いた実際の文字数。空白・改行は数えない。"""
-    text = re.sub(r"<[^>]+>", "", html or "")
-    text = re.sub(r"&[a-zA-Z]+;|&#\d+;", "x", text)
-    return len(re.sub(r"\s", "", text))
+def html_to_text(s: str) -> str:
+    """講評 HTML を改行つきの文字列にする（ログ確認用）。"""
+    s = re.sub(r"<br\s*/?>|</p>|</li>|</div>", "\n", s or "")
+    s = re.sub(r"<li>", "・", s)
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
 
 
 def _footer() -> str:
@@ -121,6 +126,8 @@ def prepend_uncertainty_note(feedback_html: str, result: dict,
     if not reason:
         reason = ("理由が返されませんでした。点数の根拠が薄い可能性があるため、"
                   "提出物と採点表を照合してください。")
+    # 改行を残す（(1)(2)(3) の区切りが1行に潰れて読めなくなるため）
+    reason = "<br>".join(html.escape(line) for line in reason.splitlines() if line.strip())
     conf = {"high": "高", "medium": "中", "low": "低"}.get(result.get("confidence"), "不明")
     decided = f"<br>この迷いを踏まえて付けた評点：<strong>{score_text}</strong>" if score_text else ""
     return (
@@ -131,6 +138,7 @@ def prepend_uncertainty_note(feedback_html: str, result: dict,
         '❓ この採点はAIが判断に迷いました（講師の確認をお願いします）</p>'
         f'<p style="margin:0">{reason}{decided}'
         f'<br>AIの確信度：{conf}</p>'
+        '<p style="margin:6px 0 0">公開（リリース）の前に、この枠を削除してください。</p>'
         "</div>"
     ) + (feedback_html or "")
 
@@ -182,6 +190,33 @@ def get_guide_criteria(cmid: int | None) -> list[dict] | None:
             if crits:
                 return crits
     return None
+
+
+def current_grades(assignid: int) -> dict[int, tuple[float | None, int | None]]:
+    """課題の現在の評点 {userid: (評点 または None, 採点者)}。未採点（-1・空）は None。"""
+    out: dict[int, tuple[float | None, int | None]] = {}
+    for a in _call("mod_assign_get_grades", {"assignmentids[0]": assignid}).get("assignments", []):
+        for g in a.get("grades", []):
+            try:
+                v = float(g.get("grade"))
+            except (TypeError, ValueError):
+                v = None
+            grader = g.get("grader")
+            out[g["userid"]] = (v if v is not None and v >= 0 else None,
+                                int(grader) if str(grader).lstrip("-").isdigit() else None)
+    return out
+
+
+def get_ai_user() -> int:
+    """このジョブ（AI）が使う Moodle アカウントのユーザーID。これ以外の採点者は人として扱う。"""
+    return int(_call("core_webservice_get_site_info", {})["userid"])
+
+
+def list_human_graded(assignid: int, ai_user: int) -> list[dict]:
+    """人（AI のトークン以外）が採点済みの提出。校正モードの対象。"""
+    return [{"userid": u, "human_grade": v, "grader": g}
+            for u, (v, g) in current_grades(assignid).items()
+            if v is not None and g not in (None, ai_user)]
 
 
 def list_pending(assignid: int) -> list[dict]:
@@ -300,6 +335,12 @@ def save_grade_draft(assignid: int, userid: int, course_id: str, feedback_html: 
         raise RuntimeError("write disabled: MOODLE_ALLOW_WRITE!=1")
     if str(course_id) not in WRITE_COURSES:
         raise RuntimeError(f"course {course_id} not in allowlist {sorted(WRITE_COURSES)}")
+    # FIX(2026-10-03 江尻指示): 採点済みの提出は決して上書きしない。人の採点か AI の採点かを
+    #   Moodle 上で見分けられない場合があるため（江尻のアカウントで手で採点することもある）、
+    #   採点が入っている提出には一切書き込まない。保存の直前に読み直して確かめる。
+    existing, grader = current_grades(assignid).get(userid, (None, None))
+    if existing is not None:
+        raise RuntimeError(f"採点済み（{existing:g}点・採点者 {grader}）のため上書きしません")
     fb = feedback_html or ""
     if _FOOTER_MARK not in fb:
         fb += _footer()
@@ -320,7 +361,8 @@ def save_grade_draft(assignid: int, userid: int, course_id: str, feedback_html: 
             params[f"{base}[fillings][0][criterionid]"] = cs["criterionid"]
             params[f"{base}[fillings][0][score]"] = cs["score"]
             params[f"{base}[fillings][0][remark]"] = cs.get("remark", "")
-            params[f"{base}[fillings][0][remarkformat]"] = 1
+            # 改行を残すため書式はプレーンテキスト（FORMAT_PLAIN=2。HTML=1 だと改行が消える）
+            params[f"{base}[fillings][0][remarkformat]"] = 2
     else:
         params["grade"] = grade
     _call("mod_assign_save_grade", params)
@@ -351,155 +393,194 @@ def read_back_grade(assignid: int, userid: int) -> float | None:
 
 
 # ---------- 採点基準の取得（毎回最新化） ----------
-def fetch_rubric_sheet_text() -> str:
-    """スプレッドシート（採点基準）を毎回読み直す。gid 指定タブ＋表紙を結合してテキスト化。"""
+def fetch_rubric_tabs() -> dict[str, list[list]]:
+    """採点表スプレッドシートの全タブを読む（実行ごとに1回。採点前に毎回最新化）。"""
     from googleapiclient.discovery import build
     import google.auth
 
     creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     svc = build("sheets", "v4", credentials=creds)
     meta = svc.spreadsheets().get(spreadsheetId=RUBRIC_SHEET_ID).execute()
-    sheets = meta.get("sheets", [])
-    titles = []
-    if RUBRIC_SHEET_GID:
-        for s in sheets:
-            if str(s["properties"]["sheetId"]) == str(RUBRIC_SHEET_GID):
-                titles.append(s["properties"]["title"])
-    if not titles:
-        titles = [sheets[0]["properties"]["title"]] if sheets else []
-
-    chunks = []
-    for title in titles:
-        rng = f"'{title}'!A1:Z200"
-        res = svc.spreadsheets().values().get(spreadsheetId=RUBRIC_SHEET_ID, range=rng).execute()
-        rows = res.get("values", [])
-        chunks.append(f"# シート: {title}\n" + "\n".join(" | ".join(r) for r in rows))
-    return "\n\n".join(chunks)
+    out: dict[str, list[list]] = {}
+    for sh in meta.get("sheets", []):
+        title = sh["properties"]["title"]
+        res = svc.spreadsheets().values().get(
+            spreadsheetId=RUBRIC_SHEET_ID, range=f"'{title}'!A1:E300").execute()
+        out[title] = res.get("values", [])
+    return out
 
 
-def load_ai_usage_rubric() -> str:
-    try:
-        with open(_AI_USAGE_RUBRIC_PATH, encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        log.warning("AI使用ログルーブリックが見つかりません: %s", _AI_USAGE_RUBRIC_PATH)
-        return ""
+def assignment_key(name: str) -> str | None:
+    """Moodle の課題名から対応表のキー（事前課題2-1 等）を取り出す。"""
+    m = re.match(r"\s*(事前課題\d(?:-\d)?|中間課題\d|修了レポート)", name or "")
+    return m.group(1) if m else None
 
 
-# ---------- Claude (Vertex AI) 採点 ----------
-GRADE_TOOL = {
-    "name": "submit_grade",
-    "description": "採点結果を構造化して返す。",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "grade": {"type": "number", "description": "0〜100の点数（配点シートに従う）"},
-            "feedback_html": {
-                "type": "string",
-                "description": "学生向けフィードバック（HTML）。観点ごとに◎/○/△/×と根拠（提出物からの引用）を明記。"
-                               "AIが下書きした旨は本文にも一言触れる（末尾の開示フッターは別途システムが付与）。",
-            },
-            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-            "needs_human_review": {"type": "boolean", "description": "機密配慮違反・事実誤認・判断が割れる場合は true"},
-            "review_reason": {
-                "type": "string",
-                "description": "採点に迷った点。needs_human_review=true のときは必須。"
-                               "『何を迷ったか』『どちらの解釈を採ってその点数にしたか』"
-                               "『講師に何を確認してほしいか』の3点を、"
-                               "提出物の該当箇所を引いて具体的に書く。"
-                               "迷わなかった場合は空でよい（迷っていないのに埋めない）。",
-            },
-        },
-        "required": ["grade", "feedback_html", "confidence", "needs_human_review"],
-    },
-}
+def rubric_for(assignment_name: str, tabs: dict[str, list[list]],
+               criteria: list[dict] | None) -> tuple[rb.Rubric | None, dict[str, dict], str]:
+    """課題に対応する採点表と、評定ガイドの基準（内容／AI使用ログ）の対応を返す。
 
-
-# FIX: 評定ガイド課題では合計点ではなく基準ごとの配点を返させる（合計は Moodle が算出する）。
-def build_grade_tool(criteria: list[dict] | None) -> dict:
+    戻り値: (採点表, {"content": 基準, "ai": 基準}, 保留理由)。保留理由が空でなければ採点しない。
+    採点表と評定ガイドの満点が食い違う場合も、どちらが正しいか判断できないため保留する。
+    """
+    key = assignment_key(assignment_name)
+    conf = RUBRIC_MAP.get(key or "")
+    if not conf:
+        return None, {}, f"採点表の対応が未設定（{key or assignment_name}）"
+    rows = tabs.get(conf["tab"])
+    if rows is None:
+        return None, {}, f"採点表にタブ「{conf['tab']}」がありません"
+    rubric = rb.build_rubric(key, conf["tab"], rows, conf.get("part"))
     if not criteria:
-        return GRADE_TOOL
-    tool = json.loads(json.dumps(GRADE_TOOL))
-    props = tool["input_schema"]["properties"]
-    props.pop("grade")
-    props["criteria"] = {
-        "type": "array",
-        "description": "評定ガイドの各基準の採点。すべての基準を必ず1つずつ含めること。",
-        "items": {
+        return None, {}, "評定ガイドが設定されていません"
+    by_kind: dict[str, dict] = {}
+    for c in criteria:
+        kind = rb.AI if "AI" in c["name"].upper() else rb.CONTENT if "内容" in c["name"] else None
+        if kind is None or kind in by_kind:
+            return None, {}, f"評定ガイドの基準「{c['name']}」を内容／AI使用ログに対応付けられません"
+        by_kind[kind] = c
+    for kind, c in by_kind.items():
+        if abs(rubric.max_of(kind) - c["maxscore"]) > 0.01:
+            return None, {}, (f"満点が一致しません：採点表「{conf['tab']}」の{rb.KIND_LABEL[kind]}は"
+                              f"{rubric.max_of(kind):g}点、評定ガイド「{c['name']}」は{c['maxscore']:g}点")
+    return rubric, by_kind, ""
+
+
+# ---------- Claude 採点 ----------
+def build_grade_tool(rubric: rb.Rubric) -> dict:
+    """採点表の減点項目だけを選べるツール定義。項目IDは enum で縛り、表に無い減点を構造的に防ぐ。"""
+    fb_props = {
+        "strengths": {"type": "array", "items": {"type": "string"},
+                      "description": "評価できる点を3〜4個（必須・1個以上）。提出物のどこが、なぜ良いかを具体的に"
+                                     "（引用や箇所を示す）。1個1論点・3〜4文・です／ます調"},
+        "suggestions": {"type": "array", "items": {"type": "string"},
+                        "description": "さらに良くするための提案を0〜2個。減点しない観点はここに書く。"
+                                       "改善点だけを書き、褒める内容は strengths に書く。何をどう直すと良いか、"
+                                       "直すとどう良くなるかまで具体的に。1個1論点・3〜4文。3〜4個（必須・1個以上）。"
+                                       "減点が無い基準でも必ず書く"},
+    }
+    ai_ids = [i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI]
+    return {
+        "name": "submit_grade",
+        "description": "採点表の減点項目に照らした採点結果を返す。点数はシステムが計算する。",
+        "input_schema": {
             "type": "object",
             "properties": {
-                "criterionid": {"type": "integer", "description": "基準ID（提示したものをそのまま使う）"},
-                "score": {"type": "number", "description": "その基準の点数（0以上、満点以下）"},
-                "remark": {"type": "string", "description": "その基準の減点・加点理由。提出物からの引用を含める。"},
+                "deductions": {
+                    "type": "array",
+                    "description": "該当した減点項目。該当なしなら空配列（満点）。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "string", "enum": [i.id for i in rubric.items()]},
+                            "count": {"type": "integer", "minimum": 1,
+                                      "description": "「1項目につき」「1か所につき」の項目は該当した件数。それ以外は1"},
+                            "reason": {"type": "string",
+                                       "description": "受講生向けに、なぜ該当するかと、次にどう直せばよいかを2〜3文で。です／ます調"},
+                            "certain": {"type": "boolean",
+                                        "description": "提出物で確実に該当と言えるなら true。判断が割れるが該当の可能性がある場合も"
+                                                       "減点に入れ、false にする（講師が確認して不要なら削除する）"},
+                            "quote": {"type": "string",
+                                      "description": "根拠となる提出物の記述をそのまま40字以内で引用"},
+                            "location": {"type": "string",
+                                         "description": "引用元（例：企画レポート.pptx スライド3、AI使用ログ 節目2）"},
+                        },
+                        "required": ["item_id", "count", "reason", "quote", "location", "certain"],
+                    },
+                },
+                # FIX(2026-09-29): AI使用ログの項目は見落としが出たため（講師が付けた −1 を2件見逃した）、
+                #   全項目について該当／非該当と根拠を返させ、確認を飛ばせないようにする。
+                "ai_checks": {
+                    "type": "array",
+                    "description": "AI使用ログの減点項目すべてについての確認結果。一覧の項目を1つも漏らさず並べる。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "string", "enum": ai_ids},
+                            "verdict": {"type": "string", "enum": ["該当", "非該当"]},
+                            "evidence": {"type": "string",
+                                         "description": "判断の根拠（どの節目・どの記述を確認したか）を1文で"},
+                        },
+                        "required": ["item_id", "verdict", "evidence"],
+                    },
+                },
+                "feedback": {
+                    "type": "object",
+                    "properties": {rb.CONTENT: {"type": "object", "properties": fb_props},
+                                   rb.AI: {"type": "object", "properties": fb_props}},
+                    "required": [rb.CONTENT, rb.AI],
+                },
+                "summary": {"type": "string",
+                            "description": "総評。内容とAI使用ログを通した全体の評価と、次に意識してほしいことを2〜4文で。"
+                                           "点数は書かない。です／ます調"},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "needs_human_review": {"type": "boolean",
+                                       "description": "減点項目への該当判断が割れる・機密配慮違反の疑いがあるときだけ true"},
+                "review_reason": {
+                    "type": "string",
+                    "description": "講師向け。needs_human_review=true のとき必須。"
+                                   "(1)何を迷ったか (2)どちらを採ってこの点にしたか (3)講師に何を確認してほしいか"
+                                   " を、それぞれ改行して書く。",
+                },
             },
-            "required": ["criterionid", "score", "remark"],
+            "required": ["deductions", "ai_checks", "feedback", "summary", "confidence",
+                         "needs_human_review"],
         },
     }
-    tool["input_schema"]["required"] = ["criteria", "feedback_html", "confidence", "needs_human_review"]
-    return tool
 
 
-# FIX(江尻指示 2026-08-29): 単独モデルの採点は観点が偏り、点数も実行ごとに振れる。
-#   性質の異なる3名で独立に採点し、4人目が突き合わせて確定する合議制にする。
-#   3名は「同じ質問に別々の角度から答える」ためのものなので、互いの答えは見せない。
+# 減点項目の解釈（講師の採点から学んだもの）。項目の文言を広く読んで見逃したり、基準外の観点で
+# 減点したりしないよう、講師が実際に減点した／しなかった判断を項目の注記としてモデルに渡す。
+# 講師採点が増えたら instructor_notes.json に1行ずつ足す（コードは変えない）。
+_NOTES_PATH = os.environ.get("INSTRUCTOR_NOTES_PATH", os.path.join(_HERE, "instructor_notes.json"))
+try:
+    with open(_NOTES_PATH, encoding="utf-8") as _f:
+        _NOTES = json.load(_f)
+except OSError:
+    _NOTES = {}
+ITEM_NOTES: dict[str, str] = _NOTES.get("items", {})
+GENERAL_NOTES: list[str] = _NOTES.get("general", [])
+
+
+def item_note(text: str) -> str:
+    return next((f"（講師の解釈: {n}）" for k, n in ITEM_NOTES.items() if k in text), "")
+
+
+def rubric_prompt(rubric: rb.Rubric) -> str:
+    lines = []
+    for s in rubric.sections:
+        if s.shared:
+            head = f"【{rb.KIND_LABEL[s.kind]}】{s.name}（課題全体で1回だけ判定する減点）"
+        else:
+            head = f"【{rb.KIND_LABEL[s.kind]}】{s.name}（満点 {s.max:g}点）"
+        lines.append(head)
+        for i in s.items:
+            lines.append(f"  - [{i.id}] {i.text}　−{rb.unit_of(rubric, i):g}点{item_note(i.text)}")
+    return "\n".join(lines)
+
+
+STYLE_RULES = (
+    "【講評の書き方（受講生が読む）】\n"
+    "- です／ます調。1文はなるべく60字以内、1つの箇条は2〜3文。1つの箇条に1つの論点だけを書く。\n"
+    "- 講師は、AIの講評から不要な部分を削って使う。足りない説明を講師が書き足すより、削るほうが負担が少ないので、"
+    "説明は多めに書く。基準（内容／AI使用ログ）ごとに、評価できる点・減点理由・さらに良くするなら を合わせて"
+    "1,000字前後（900〜1,200字）を目安にする。\n"
+    "- 評価できる点と、さらに良くするなら は、どの基準でも必ず書く（満点の基準でも改善点を書く）。\n"
+    "- 受講生が知らない採点の内部用語を使わない（採点者A/B/C、合議、節目平均、内部修正点、"
+    "外部追加点、整形明示、ルーブリック、§、項目ID など）。\n"
+    "- 提出物を引用するときは「」でくくり、40字以内にする。\n"
+    "- 見出し・記号・改行はシステムが付けるので、各欄には文だけを書く。\n"
+)
+
+# FIX(2026-09-29 江尻指示): 合議の3名にも採点表の項目以外では減点させない。
+#   観点の違いは「どの項目に該当するかの見方」と「改善提案」に出す。
 PANEL = [
-    ("A_減点照合", (
-        "あなたは採点表との照合を専門とする採点者である。\n"
-        "- 採点表の減点条件を上から一つずつ、提出物に該当する記述があるかを機械的に確認する。\n"
-        "- 必須要件（指定の項目数・図・キャプチャ・指定フォーマット・字数）の欠落を最優先で拾う。\n"
-        "- 提案の中身が良いかどうかは他の採点者に任せ、あなたは要件充足だけを見る。\n"
-        "- 『書いてあるように読めなくもない』は不充足として扱う。"
-    )),
-    ("B_実務妥当性", (
-        "あなたはウェブ解析の実務家として提出物を読む採点者である。\n"
-        "- この施策・数値・計測設計が、実際の現場でそのまま通用するかを見る。\n"
-        "- KPIの因果が飛んでいないか、数値の出所が示されているか、"
-        "コストや工数の見積りが相場から外れていないか、計測が技術的に実現可能かを問う。\n"
-        "- 形式が整っていても中身が空虚なら減点する。逆に形式の軽微な不備は他の採点者に任せる。"
-    )),
-    ("C_教育的観点", (
-        "あなたは受講生の到達度を見る指導者としての採点者である。\n"
-        "- 何が身についていて、何が身についていないかを切り分ける。\n"
-        "- 提出物の背後にある理解を評価する。用語をなぞっただけか、自分の事業に落とせているか。\n"
-        "- 過剰な減点を疑う役割も担う。形式不備で実質的な理解まで低く見積もっていないかを点検する。\n"
-        "- ただし甘くつけてよいという意味ではない。理解が浅い箇所は明確に減点する。"
-    )),
+    ("A_照合", "あなたは採点表との照合を担当する。減点項目を上から1つずつ、提出物に該当する記述があるかを確認する。"),
+    ("B_実務", "あなたは実務家の目で読む。数値・計測・施策が減点項目に該当するかを、実務で通用するかの観点で厳密に判定する。"
+               "採点表の項目に当たらない実務上の指摘は、改善提案に書く。"),
+    ("C_教育", "あなたは指導者の目で読む。過剰な減点が無いか、引用が本当に項目に該当するかを点検する。"
+               "理解の浅さが採点表の項目に当たらないときは、改善提案に書く。"),
 ]
-
-
-def grade_submission(client, rubric_text: str, ai_usage_rubric: str, assignment_name: str,
-                      onlinetext: str, files: list[str],
-                      criteria: list[dict] | None = None,
-                      file_text: str = "", unreadable: list[str] | None = None,
-                      feedback_limit: int = FEEDBACK_MAX_CHARS,
-                      images: list[dict] | None = None) -> dict:
-    """性質の異なる3名で独立採点し、4人目が確定させる。PANEL_MODE=0 で従来の単独採点。"""
-    if not PANEL_MODE:
-        return _grade_once(client, rubric_text, ai_usage_rubric, assignment_name, onlinetext,
-                           files, criteria, file_text, unreadable, feedback_limit, images=images)
-    drafts = []
-    for name, stance in PANEL:
-        try:
-            d = _grade_once(client, rubric_text, ai_usage_rubric, assignment_name, onlinetext,
-                            files, criteria, file_text, unreadable, feedback_limit, stance=stance,
-                            images=images)
-            drafts.append((name, d))
-            log.info("  合議 %s: %s", name, _score_digest(d, criteria))
-        except Exception as e:
-            log.warning("  合議 %s が失敗: %s: %s", name, type(e).__name__, e)
-    if not drafts:
-        raise RuntimeError("3名の採点がすべて失敗しました")
-    if len(drafts) == 1:
-        log.warning("  合議: 1名しか成立しなかったため、その結果をそのまま採用します")
-        return drafts[0][1]
-    return synthesize(client, drafts, rubric_text, assignment_name, criteria, feedback_limit)
-
-
-def _score_digest(d: dict, criteria: list[dict] | None) -> str:
-    if criteria:
-        return " / ".join(f"{c.get('criterionid')}={c.get('score')}"
-                          for c in (d.get("criteria") or []))
-    return str(d.get("grade"))
 
 
 def build_user_content(text: str, images: list[dict] | None) -> str | list[dict]:
@@ -515,322 +596,219 @@ def build_user_content(text: str, images: list[dict] | None) -> str | list[dict]
     return blocks
 
 
-def _grade_once(client, rubric_text: str, ai_usage_rubric: str, assignment_name: str,
-                onlinetext: str, files: list[str],
-                criteria: list[dict] | None = None,
-                file_text: str = "", unreadable: list[str] | None = None,
-                feedback_limit: int = FEEDBACK_MAX_CHARS,
-                stance: str = "", images: list[dict] | None = None) -> dict:
-    tool = build_grade_tool(criteria)
-    # FIX(江尻指示 2026-08-29): 基準ごとの remark は「減点根拠」であり、講師が判断を追うための欄。
-    #   上限を課すと根拠が途中で切れて講師も判断がつかなくなるため、字数制限をかけない。
-    #   全体講評（feedback_html）の上限は従来どおり維持する。
-    remark_limit = None
-    length_rule = (
-        "【講評の長さ（厳守）】\n"
-        f"- feedback_html は本文{feedback_limit}文字以内。タグを除いた文字数で数える。\n"
-        "- 各基準の remark に字数制限はない。減点根拠は省略せず、"
-        "何点引いたか・提出物のどの記述が根拠かを必要なだけ書く。\n"
-        "- feedback_html では冗長な前置き、提出物の要約、励ましの定型文は書かない。"
-        "何点減点したか、その根拠、次にどう直すかだけを簡潔に書く。\n"
-        "- 見出しや箇条書きの多用で行数を稼がない。\n\n"
-    )
-    guide_note = ""
-    if criteria:
-        rows = "\n".join(f"  - criterionid={c['id']} 「{c['name']}」 満点 {c['maxscore']:g}点"
-                         for c in criteria)
-        guide_note = ("\n=== この課題の評定ガイド（基準ごとに採点すること） ===\n"
-                      f"{rows}\n"
-                      "各基準について criterionid をそのまま使い、0以上・満点以下の点数と理由を返すこと。"
-                      "合計点は Moodle 側が算出するため、合計を返す必要はない。\n")
-    stance_block = ""
-    if stance:
-        stance_block = ("【あなたの担当観点】\n"
-                        f"{stance}\n"
-                        "他の採点者が別の観点から同じ提出物を採点している。"
-                        "あなたは自分の観点を最後まで貫くこと。全体のバランスを取ろうとしなくてよい。\n\n")
-    system = (
-        "あなたは上級ウェブ解析士認定講座の採点者です。以下の採点基準スプレッドシートの内容と、"
-        "AI使用ログ採点ルーブリックに厳密に従い、提出物を採点してください。\n"
+def _system(rubric: rb.Rubric, stance: str = "") -> str:
+    stance_block = f"【あなたの担当】\n{stance}\n\n" if stance else ""
+    return (
+        "あなたは上級ウェブ解析士認定講座の採点者です。採点の根拠は、下に示す採点表の減点項目だけです。\n"
         f"{stance_block}"
-        "厳守事項:\n"
-        "- 点数だけでなく、必ず提出物からの具体的な引用を根拠として示すこと。\n"
-        "- 機密配慮チェック（実在の顧客名・PII・第三者情報の無断使用等）に違反が1件でもあれば "
-        "AI使用ログ該当部分は0点とし、needs_human_review=true にすること。\n"
-        "- 事実誤認がある場合はその節目を0点とし、根拠を明記すること。\n"
-        "- あなたはドラフトを作るだけであり、最終判断・公開は人間の講師が行う。フィードバックは"
-        "『AIによる採点ドラフトである』ことが伝わる書き方にすること。\n"
-        # FIX(江尻指示 2026-08-29): 迷いを隠さず、迷ったうえでの判断として明示させる。
-        "【迷ったときの書き方（重要）】\n"
-        "- 採点に迷ったら、迷いを消して断定するのではなく needs_human_review=true にし、"
-        "review_reason に次の3点を必ず書くこと。\n"
-        "  (1) 何を迷ったか（どの要件・どの記述の解釈が割れるか）\n"
-        "  (2) どちらの解釈を採って、その結果この点数にしたか\n"
-        "  (3) 講師に何を確認してほしいか\n"
-        "- review_reason には提出物の該当箇所を引用すること。抽象的な『判断が難しい』は書かない。\n"
-        "- 迷っていないのに needs_human_review=true にしてはならない。"
-        "本当に解釈が割れる論点があるときだけ立てること。\n\n"
-        "- 判断に迷う場合は needs_human_review=true にし、理由を書くこと（保留せず0点扱いにはしない。"
-        "ただし機密配慮違反・事実誤認は上記の通り即0点）。\n\n"
-        # 2026-08-28 江尻指示：甘い採点は講師レビューの意味を失わせるため、厳格側に倒す。
-        "【採点の厳しさ（必ず従うこと）】\n"
-        "- この採点は講師が確認するための素案である。甘くつけると確認の意味がなくなる。\n"
-        "- 合格ラインは満点の7割。平均的な提出物が『不合格〜ギリギリ合格』（満点の6〜7割）に"
-        "収まるよう厳格に採点すること。\n"
-        "- 満点は原則としてつけない。満点にしてよいのは、要求事項をすべて満たしていることを"
-        "提出物の具体的な記述で一つ残らず立証できる場合のみである。\n"
-        "- 減点条件に形式的にでも該当するものは必ず減点する。見逃して加点する側に倒さない。\n"
-        "- 『概ね良い』『特に問題ない』という印象で点を与えてはならない。加点は提出物の"
-        "該当箇所を引用できるときに限る。\n"
-        "- 判断が割れる論点、記述が薄い観点、裏付けのない主張は減点し、その旨を講評に書くこと。\n"
-        "- 点数の目安: 満点の9割超は『模範解答として他の受講生に配布できる』水準に限る。"
-        "要求を一通り満たしただけの提出物は7割（合格ライン）。"
-        "どこかに不足・薄さがあれば6割台（不合格）に落とす。\n"
-        "- 各基準について、適用した減点を最低1つは具体的に挙げること。"
-        "減点が1つも見つからない場合は、減点条件を見落としていないか一覧を再確認したうえで、"
-        "なぜ無減点なのかを提出物の記述を引いて説明すること。\n"
-        "- 採点は減点方式で計算すること。加点を積み上げるのではなく、満点から出発し、"
-        "採点表の減点条件に該当するものを1件ずつ差し引く。remark には"
-        "『満点−(条件A)−(条件B)=点数』の形で、適用した減点条件とその根拠となる"
-        "提出物の記述を必ず明示すること。\n"
-        "- 減点条件は『明確に満たしている』と言い切れない限り該当と見なす。"
-        "受講生に有利な解釈で見逃してはならない。\n"
-        "- 採点を確定する前に自己点検すること: 合計が満点の8割を超えているなら、"
-        "『甘すぎないか』『引用した根拠は本当に要求を満たしているか』を見直し、"
-        "根拠が薄い加点は取り消すこと。\n\n"
-        f"{length_rule}"
-        f"=== 採点基準スプレッドシート ===\n{rubric_text}\n\n"
-        f"=== AI使用ログ採点ルーブリック ===\n{ai_usage_rubric}\n"
-        f"{guide_note}"
+        "【採点のしかた（必ず従うこと）】\n"
+        "- 減点は、下の一覧にある項目だけから選ぶ。一覧に無い観点では減点しない。\n"
+        "- 減点するときは、該当を立証する提出物の記述を quote に引用する。引用で立証できない減点はしない。\n"
+        "- 厳しめに採点する。該当する項目は見逃さずに拾う。判断が割れるが該当の可能性がある項目も減点に入れ、"
+        "certain=false にする（講師は、見逃しを探して減点を足すより、不要な減点を削るほうが負担が少ない）。"
+        "一覧のどの項目にも該当しなければ満点でよい。\n"
+        "- 一覧に無い改善点・物足りない点は、減点せず feedback の suggestions（さらに良くするなら）に、"
+        "何をどう直すと良いかまで具体的に書く。\n"
+        "- 点数はシステムが計算する。点数や合計を文章に書かない。\n"
+        "- 回答内容の項目は提出ファイルの本文を根拠にする。AI使用ログの項目は、オンラインテキストのAI使用ログを根拠にする。\n"
+        "- 減点項目への該当判断が割れるとき、機密配慮違反の疑いがあるときは needs_human_review=true にする。\n\n"
+        "【AI使用ログの確認手順（全項目を ai_checks に記録する）】\n"
+        "- 節目（AIを使った作業の区切り）ごとに、次を確認する。\n"
+        "  (a) プロンプトの要約だけでなく、AIの出力の要約も記録されているか（無ければ「会話ログ（要約可）が提出されていない」に該当）\n"
+        "  (b) 外部追加ごとに、いつ・どこで・何にもとづくかが書かれ、その記録で主張を裏付けられるか。"
+        "「以前は〜だった」など変化を主張しているのに、変化前の記録が無い場合は、出所を特定できない外部追加として扱う\n"
+        "  (c) 修正種類の自己申告が、書かれた修正内容と一致しているか\n"
+        "  (d) ログに書かれた修正が、提出物に反映されているか\n"
+        "- ai_checks で「該当」とした項目は、必ず deductions にも入れる。「非該当」とした項目は deductions に入れない。\n\n"
+        f"{STYLE_RULES}\n"
+        + ("【講師の採点の傾向（過去の講師採点から）】\n" + "".join(f"- {n}\n" for n in GENERAL_NOTES) + "\n"
+           if GENERAL_NOTES else "") +
+        f"=== 採点表「{rubric.tab}」の減点項目（{rubric.key}） ===\n{rubric_prompt(rubric)}\n"
     )
-    # FIX: 提出ファイルの本文を採点対象に含める。読めなかった場合はその旨を明示し、
-    #      中身を見ずに満点を付けることがないようにする。
-    unreadable = unreadable or []
-    warn = ""
-    if unreadable:
-        warn = ("\n【重要】次の提出ファイルは本文を読み取れませんでした: "
-                f"{', '.join(unreadable)}\n"
-                "読めなかった提出物の内容について推測で加点してはならない。"
-                "その観点は満点にせず、needs_human_review=true とし、"
-                "講評に『ファイルを確認できなかったため講師の確認が必要』と明記すること。\n")
-    images = images or []
+
+
+def _user(assignment_name: str, onlinetext: str, files: list[str], file_text: str,
+          images: list[dict]) -> str:
     image_note = ""
     if images:
         image_note = (f"提出ファイルに含まれる図・画像を{len(images)}枚、このメッセージの後ろに添付した"
                       "（各画像の直前に「ファイル名 / 画像名」を記す）。図・表・スクリーンショットの内容も"
-                      "採点根拠にしてよい。画像から読み取った内容を引用するときは、どの画像かを示すこと。\n")
-    user = (
+                      "採点根拠にしてよい。\n")
+    return (
         f"課題名: {assignment_name}\n"
-        f"=== オンラインテキスト（多くの課題ではAI使用ログ） ===\n"
-        f"{onlinetext or '(なし)'}\n\n"
-        f"=== 提出ファイルの本文（多くの課題では回答本体） ===\n"
-        f"{file_text or '(添付ファイルなし、または本文を抽出できませんでした)'}\n\n"
-        f"添付ファイル名: {', '.join(files) if files else '(なし)'}\n"
-        f"{image_note}"
-        f"{warn}\n"
-        "注意: オンラインテキストのAI使用ログは『AIをどう使ったか』の記録であり、"
-        "回答本体そのものではない。回答内容の観点は、必ず提出ファイルの本文を根拠に採点し、"
-        "AI使用ログの自己申告を回答本体の記述として引用しないこと。\n\n"
-        "上記の採点基準に従い submit_grade ツールで採点結果を返してください。"
+        f"=== オンラインテキスト（多くの課題ではAI使用ログ） ===\n{onlinetext or '(なし)'}\n\n"
+        f"=== 提出ファイルの本文（多くの課題では回答本体） ===\n{file_text or '(添付ファイルなし)'}\n\n"
+        f"添付ファイル名: {', '.join(files) if files else '(なし)'}\n{image_note}\n"
+        "submit_grade ツールで採点結果を返してください。"
     )
-    # FIX: max_tokens 不足で tool_use の JSON が途中で切れ、feedback_html が欠落して
-    #      KeyError になり採点が保存されない事故があったため、出力枠を広げたうえで
-    #      stop_reason と必須キーを検証し、欠けていれば簡潔化を指示して1回だけ再試行する。
-    # FIX: confidence 等の補助項目が欠けただけで採点全体を落とすのは過剰。
-    #      点数と講評という本質的な項目だけを必須とし、残りは既定値で補う。
-    required = ["criteria", "feedback_html"] if criteria else ["grade", "feedback_html"]
-    last_err = ""
-    extra = ""
-    for attempt in (1, 2):
-        resp = client.messages.create(
-            # NOTE: 導入済み SDK の messages.create は temperature を受け付けないため指定しない。
-            # 点数のばらつきは減点方式の明示（システムプロンプト）で抑える。
-            model=MODEL, max_tokens=MAX_OUTPUT_TOKENS, system=system,
-            tools=[tool], tool_choice={"type": "tool", "name": "submit_grade"},
-            messages=[{"role": "user", "content": build_user_content(user + extra, images)}],
-        )
-        tool_input = None
-        for block in resp.content:
-            if block.type == "tool_use" and block.name == "submit_grade":
-                tool_input = block.input
-                break
-        if tool_input is None:
-            last_err = f"submit_grade が呼ばれませんでした (stop_reason={resp.stop_reason})"
-            extra = ("\n\n重要: 前回は出力上限で応答が切れました。"
-                     f"feedback_html を{feedback_limit}文字以内に収めてください。")
-        else:
-            missing = [k for k in required if k not in tool_input]
-            if missing:
-                last_err = (f"必須項目が欠落: {missing} (stop_reason={resp.stop_reason}, "
-                            f"output_tokens={resp.usage.output_tokens})")
-                extra = ("\n\n重要: 前回は出力上限で応答が切れ、項目が欠落しました。"
-                         f"feedback_html を{feedback_limit}文字以内に収めてください。")
-            else:
-                # 江尻指示の文字数上限。超えていたら一度だけ短く書き直させる。
-                # 機械的に切り詰めると文の途中で切れるため、再生成を優先する。
-                # remark（減点根拠）は字数を見ない。全体講評だけを上限判定する。
-                fb_len = visible_len(tool_input.get("feedback_html", ""))
-                if fb_len <= feedback_limit:
-                    return fill_defaults(tool_input)
-                last_err = f"講評が長すぎます: feedback_html が{fb_len}文字（上限{feedback_limit}文字）"
-                extra = (f"\n\n重要: 前回の feedback_html が{fb_len}文字で上限を超えました。"
-                         "減点の根拠と改善点だけに絞り、文を途中で切らずに"
-                         f"{feedback_limit}文字以内で書き直してください。"
-                         "各基準の remark は字数制限がないので短くしないでください。")
-                if attempt == 2:
-                    log.warning("2回目も上限超過（%s）。末尾を切り詰めます。", last_err)
-                    return fill_defaults(trim_feedback(tool_input, feedback_limit, remark_limit))
-        log.warning("採点出力が不完全 (%d回目): %s", attempt, last_err)
-    raise RuntimeError(f"採点出力が不完全なため中止: {last_err}")
 
 
-def synthesize(client, drafts: list[tuple[str, dict]], rubric_text: str,
-               assignment_name: str, criteria: list[dict] | None,
-               feedback_limit: int) -> dict:
-    """3名の採点案を突き合わせ、講師が読む1本の採点に確定させる（4人目）。"""
-    tool = build_grade_tool(criteria)
-    blocks = []
-    for name, d in drafts:
-        if criteria:
-            rows = "\n".join(
-                f"  基準{c.get('criterionid')}: {c.get('score')}点\n  根拠: {c.get('remark') or ''}"
-                for c in (d.get("criteria") or []))
-        else:
-            rows = f"  評点: {d.get('grade')}点"
-        blocks.append(f"--- 採点者{name} ---\n{rows}\n  講評: "
-                      f"{re.sub(r'<[^>]+>', ' ', d.get('feedback_html') or '')}\n"
-                      f"  要人手確認: {d.get('needs_human_review')}")
-    guide_note = ""
-    if criteria:
-        guide_note = "\n".join(f"  - criterionid={c['id']} 「{c['name']}」 満点 {c['maxscore']:g}点"
-                               for c in criteria)
-        guide_note = f"\n=== この課題の評定ガイド ===\n{guide_note}\n"
-    system = (
-        "あなたは上級ウェブ解析士認定講座の主任採点者である。"
-        "性質の異なる3名の採点者が、同じ提出物を独立に採点した。"
-        "あなたの仕事は、3案を突き合わせて講師に渡す最終案を1本にまとめることである。\n\n"
-        "【確定のしかた】\n"
-        "- 点数は平均や多数決で決めない。提出物の具体的な記述を引用できている根拠が"
-        "最も強い意見を採る。根拠のない主張は、何名が言っていても採らない。\n"
-        "- 3名の点が割れた基準は、なぜその点にしたかを remark に一行で書く。\n"
-        "- ある採点者だけが見つけた減点でも、根拠が具体的なら採用する。"
-        "見落としを拾うのが3名で採点する目的である。\n"
-        "- 誰か1名でも機密配慮違反・事実誤認を指摘していたら、その指摘を検証し、"
-        "妥当なら該当部分を0点にして needs_human_review=true にする。\n"
-        "- 3名の点が大きく割れた（満点の2割以上の開き）場合は needs_human_review=true にする。\n\n"
-        "【迷いの申告（重要）】\n"
-        "- needs_human_review=true にしたときは、review_reason に次の3点を必ず書く。\n"
-        "  (1) 3名のどこが割れたか、または何の解釈が定まらないか\n"
-        "  (2) どちらを採って、その結果この点数にしたか\n"
-        "  (3) 講師に何を確認してほしいか\n"
-        "- 提出物の該当箇所を引いて具体的に書く。『判断が難しい』だけでは不可。\n"
-        "- 3名の意見が一致し、根拠も揃っているなら needs_human_review=false でよい。"
-        "迷っていないのに立てない。\n\n"
-        "【講評の書き方（最重要）】\n"
-        "- 講師が短時間で判断できることだけを目的に書く。3名の議論の経過は書かない。\n"
-        f"- feedback_html は本文{feedback_limit}文字以内。結論から書く。\n"
-        "- 各基準の remark に字数制限はない。減点根拠は"
-        "『満点−(条件A)−(条件B)=点数』の形で、根拠となる提出物の記述とともに省略せず書く。\n"
-        "- 3名の採点者名（A/B/C）を講評に出さない。1人の採点者が書いたように読めること。\n"
-        f"{guide_note}\n"
-        f"=== 採点基準スプレッドシート ===\n{rubric_text}\n"
-    )
-    user = (f"課題名: {assignment_name}\n\n" + "\n\n".join(blocks) +
-            "\n\n上記3案を踏まえ、submit_grade ツールで最終的な採点を1本返してください。")
+def _call_tool(client, system: str, content, tool: dict) -> tuple[dict | None, str]:
     resp = client.messages.create(
         model=MODEL, max_tokens=MAX_OUTPUT_TOKENS, system=system,
         tools=[tool], tool_choice={"type": "tool", "name": "submit_grade"},
-        messages=[{"role": "user", "content": user}],
+        messages=[{"role": "user", "content": content}],
     )
     for block in resp.content:
         if block.type == "tool_use" and block.name == "submit_grade":
-            out = block.input
-            if visible_len(out.get("feedback_html", "")) > feedback_limit:
-                out = trim_feedback(out, feedback_limit)
-            log.info("  合議 統合: %s", _score_digest(out, criteria))
-            return fill_defaults(out)
-    # 統合に失敗したら、独立採点のうち最も辛いものを採る（甘い側に倒さない）。
-    log.warning("  合議 統合に失敗（stop_reason=%s）。最も厳しい採点案を採用します", resp.stop_reason)
-    def total(d: dict) -> float:
-        if criteria:
-            return sum(float(c.get("score") or 0) for c in (d.get("criteria") or []))
-        return float(d.get("grade") or 0)
-    spread = ", ".join(f"{n}={total(d):g}点" for n, d in drafts)
-    picked = min(drafts, key=lambda nd: total(nd[1]))[1]
+            return block.input, resp.stop_reason
+    return None, resp.stop_reason
+
+
+# 長さの不足は直させるが、直らなくても要確認にはしない（採点の正しさとは別の問題のため）
+SOFT = "[長さ] "
+MIN_COMMENT_CHARS = int(os.environ.get("MIN_COMMENT_CHARS", "800"))
+
+
+def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], list[str]]:
+    """モデルの出力を検証する。戻り値は (採用する減点, 問題点)。"""
+    if result is None:
+        return [], ["submit_grade が呼ばれませんでした"]
+    # 型が崩れた出力（配列の要素が文字列など）で落ちないよう、先に形を確かめる
+    for key, typ in (("deductions", list), ("ai_checks", list), ("feedback", dict)):
+        if key in result and not isinstance(result[key], typ):
+            return [], [f"{key} の形式が不正（{type(result[key]).__name__}）"]
+    if any(not isinstance(x, dict) for k in ("deductions", "ai_checks") for x in result.get(k) or []):
+        return [], ["deductions / ai_checks の要素がオブジェクトではない"]
+    for k in (rb.CONTENT, rb.AI):
+        v = (result.get("feedback") or {}).get(k)
+        if v is not None and not isinstance(v, dict):
+            return [], [f"feedback.{k} の形式が不正（{type(v).__name__}）"]
+    problems = [f"必須項目が欠落: {k}" for k in ("deductions", "feedback") if k not in result]
+    deductions, bad = rb.validate_deductions(rubric, result.get("deductions"))
+    problems += bad
+    fb = result.get("feedback") or {}
+    texts = [result.get("summary") or ""]
+    texts += [t for k in (rb.CONTENT, rb.AI) for f in ("strengths", "suggestions")
+              for t in ((fb.get(k) or {}).get(f) or [])]
+    texts += [d.get("reason") or "" for d in deductions]
+    ai_ids = {i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI}
+    checks = {str(c.get("item_id")): c.get("verdict") for c in (result.get("ai_checks") or [])}
+    missing = sorted(ai_ids - set(checks))
+    if missing:
+        problems.append(f"ai_checks に確認していない項目がある: {missing}")
+    deducted = {d["item_id"] for d in deductions if d["item_id"] in ai_ids}
+    hit_ids = {k for k, v in checks.items() if v == "該当"}
+    if deducted != hit_ids:
+        problems.append(f"ai_checks で「該当」とした項目 {sorted(hit_ids - deducted)} を deductions に入れていない、"
+                        f"または「非該当」の項目 {sorted(deducted - hit_ids)} を減点している。"
+                        "「該当」と判断した項目は、提出物の引用をつけて deductions に入れること")
+    for kind in (rb.CONTENT, rb.AI):
+        f = fb.get(kind) or {}
+        n = sum(len(t) for k in ("strengths", "suggestions") for t in (f.get(k) or []) if isinstance(t, str))
+        n += sum(len(d.get("reason") or "") for d in deductions
+                 if rubric.section_of(rubric.item(d["item_id"])).kind == kind)
+        if n < MIN_COMMENT_CHARS:
+            problems.append(f"{SOFT}{rb.KIND_LABEL[kind]}のコメントが短い（{n}字）。"
+                            "評価できる点・減点理由・さらに良くするなら を合わせて1,000字前後を目安に、具体的に書き足すこと")
+        for k, label in (("strengths", "評価できる点"), ("suggestions", "さらに良くするなら")):
+            if not [t for t in (f.get(k) or []) if isinstance(t, str) and t.strip()]:
+                problems.append(f"{rb.KIND_LABEL[kind]}の「{label}」が空。必ず1個以上書くこと")
+    hit = rb.forbidden_in(texts)
+    if hit:
+        problems.append(f"受講生向けの文に内部用語: {hit}")
+    return deductions, problems
+
+
+def _grade_once(client, rubric: rb.Rubric, assignment_name: str, onlinetext: str,
+                files: list[str], file_text: str, images: list[dict], stance: str = "") -> dict:
+    """1名分の採点。出力を検証し、問題があれば1回だけ直させる。直らなければ要確認にする。"""
+    tool = build_grade_tool(rubric)
+    system = _system(rubric, stance)
+    user = _user(assignment_name, onlinetext, files, file_text, images)
+    extra = ""
+    result, problems = None, []
+    for attempt in (1, 2):
+        result, stop = _call_tool(client, system, build_user_content(user + extra, images), tool)
+        deductions, problems = check_result(rubric, result)
+        if not problems:
+            return {**fill_defaults(result), "deductions": deductions}
+        log.warning("採点出力に問題 (%d回目, stop=%s): %s", attempt, stop, problems)
+        extra = ("\n\n重要: 前回の出力に次の問題がありました。直して返してください。\n- "
+                 + "\n- ".join(problems))
+    if result is None:
+        raise RuntimeError(f"採点出力が得られませんでした: {problems}")
+    result = fill_defaults(result)
+    result["deductions"] = deductions
+    hard = [p for p in problems if not p.startswith(SOFT)]
+    if hard:
+        result["needs_human_review"] = True
+        result["review_reason"] = ((result.get("review_reason") or "") +
+                                   "\n(システム) 採点出力の検証で問題が残りました: " + " / ".join(hard)).strip()
+    return result
+
+
+def grade_submission(client, rubric: rb.Rubric, assignment_name: str, onlinetext: str,
+                     files: list[str], file_text: str = "", images: list[dict] | None = None) -> dict:
+    """性質の異なる3名で独立採点し、4人目が確定させる。PANEL_MODE=0 で単独採点。"""
+    images = images or []
+    if not PANEL_MODE:
+        return _grade_once(client, rubric, assignment_name, onlinetext, files, file_text, images)
+    drafts = []
+    for name, stance in PANEL:
+        try:
+            d = _grade_once(client, rubric, assignment_name, onlinetext, files, file_text, images, stance)
+            drafts.append((name, d))
+            log.info("  合議 %s: 減点 %s", name, [f"{x['item_id']}x{x['count']}" for x in d["deductions"]])
+        except Exception as e:
+            log.warning("  合議 %s が失敗: %s: %s", name, type(e).__name__, e)
+    if not drafts:
+        raise RuntimeError("3名の採点がすべて失敗しました")
+    if len(drafts) == 1:
+        return drafts[0][1]
+    return synthesize(client, rubric, drafts, assignment_name, onlinetext, files, file_text)
+
+
+def synthesize(client, rubric: rb.Rubric, drafts: list[tuple[str, dict]], assignment_name: str,
+               onlinetext: str, files: list[str], file_text: str) -> dict:
+    """3名の採点案を突き合わせ、講師に渡す1本に確定させる（4人目）。"""
+    tool = build_grade_tool(rubric)
+    blocks = []
+    for name, d in drafts:
+        ded = "\n".join(f"  - [{x['item_id']}]×{x['count']} 「{x.get('quote', '')}」 {x.get('reason', '')}"
+                        for x in d["deductions"]) or "  （減点なし）"
+        flagged = "\n".join(f"  - [{c.get('item_id')}] {c.get('evidence', '')}"
+                            for c in (d.get("ai_checks") or []) if isinstance(c, dict) and c.get("verdict") == "該当")
+        blocks.append(f"--- 採点案{name[0]} ---\n{ded}\n"
+                      + (f"  AI使用ログで該当と判断した項目:\n{flagged}\n" if flagged else "")
+                      + f"  要確認: {d.get('needs_human_review')}")
+    system = _system(rubric) + (
+        "\n【あなたの役割】3名の採点者が独立に付けた減点案を突き合わせ、最終案を1本にまとめる。\n"
+        "- 各減点は、引用が本当にその項目に該当するかを提出物で確かめてから採る。人数では決めない。\n"
+        "- 誰か1名でも「該当」と判断した項目は、提出物を読んで該当しないと言い切れない限り減点に入れる（厳しめに採点する。"
+        "不要な減点は講師が削除する）。\n"
+        "- 2名以上が該当とし、提出物でも確かめられた減点は certain=true、1名だけ・判断が割れる減点は certain=false にする。\n"
+        "- 3名の判断が割れ、提出物でも決めきれない減点があれば needs_human_review=true にし、"
+        "review_reason に理由を書く。\n"
+        "- 評価できる点・改善提案は3案から重複を除いて選び直す。採点者が複数いたことは受講生向けの文に書かない。\n"
+    )
+    user = (_user(assignment_name, onlinetext, files, file_text, []) +
+            "\n\n=== 3名の減点案 ===\n" + "\n\n".join(blocks))
+    for attempt in (1, 2):
+        result, stop = _call_tool(client, system, user, tool)
+        deductions, problems = check_result(rubric, result)
+        if not problems or (attempt == 2 and all(p.startswith(SOFT) for p in problems)):
+            log.info("  合議 統合: 減点 %s", [f"{x['item_id']}x{x['count']}" for x in deductions])
+            return {**fill_defaults(result), "deductions": deductions}
+        log.warning("統合の出力に問題 (%d回目, stop=%s): %s", attempt, stop, problems)
+        user += "\n\n重要: 前回の出力に次の問題がありました。直して返してください。\n- " + "\n- ".join(problems)
+    # 統合に失敗したら、最も減点の多い案を採る（甘い側に倒さない）。講師に確認を求める。
+    def lost(d: dict) -> float:
+        return rb.compute_scores(rubric, d["deductions"])["total"]
+    picked = dict(min(drafts, key=lambda nd: lost(nd[1]))[1])
     picked["needs_human_review"] = True
-    picked["review_reason"] = (
-        f"3名の採点を統合する処理が失敗したため、最も厳しい採点案をそのまま採用しました"
-        f"（3名の合計点: {spread}）。統合を経ていないため、"
-        "点数と講評が他の観点を反映できていません。講師による確認をお願いします。")
+    picked["review_reason"] = "3名の採点を統合する処理が失敗したため、最も厳しい案をそのまま採用しました。"
     return picked
 
 
 def fill_defaults(result: dict) -> dict:
     """補助項目が欠けていた場合に安全側の既定値を入れる。"""
-    if "confidence" not in result:
-        result["confidence"] = "low"
-        log.warning("confidence が返らなかったため low として扱います")
+    result.setdefault("confidence", "low")
     if "needs_human_review" not in result:
         result["needs_human_review"] = True
         log.warning("needs_human_review が返らなかったため true（要確認）として扱います")
+    result.setdefault("feedback", {})
     return result
-
-
-def _cut_at_sentence(text: str, limit: int) -> str:
-    """上限以内で、できるだけ文の切れ目（句点）で切る。語の途中で切らないため。"""
-    if len(text) <= limit:
-        return text
-    head = text[:limit]
-    for mark in ("。", "\n", "、"):
-        pos = head.rfind(mark)
-        if pos >= limit * 0.6:  # 極端に短くなるなら諦めて素直に切る
-            return head[:pos + 1]
-    return head + "…"
-
-
-def trim_feedback(result: dict, feedback_limit: int, remark_limit: int | None = None) -> dict:
-    """上限を超えた全体講評を安全に切り詰める（再生成しても収まらなかったときの最後の砦）。
-
-    remark（減点根拠）は講師が判断を追う欄なので、remark_limit が None なら一切切らない。
-    """
-    fb = result.get("feedback_html") or ""
-    if visible_len(fb) > feedback_limit:
-        plain = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fb)).strip()
-        result["feedback_html"] = f"<p>{_cut_at_sentence(plain, feedback_limit)}</p>"
-    if remark_limit is not None:
-        for c in result.get("criteria") or []:
-            r = c.get("remark") or ""
-            if len(r) > remark_limit:
-                c["remark"] = _cut_at_sentence(r, remark_limit)
-    return result
-
-
-# FIX: LLM が基準を取りこぼしたり満点を超える点数を返すことがあるため、保存前に検証する。
-def normalize_criteria_scores(returned: Any, criteria: list[dict]) -> list[dict]:
-    by_id = {c["id"]: c for c in criteria}
-    got: dict[int, dict] = {}
-    for item in returned or []:
-        try:
-            cid = int(item["criterionid"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if cid in by_id:
-            got[cid] = item
-    missing = [by_id[cid]["name"] for cid in by_id if cid not in got]
-    if missing:
-        raise RuntimeError(f"評定ガイドの基準が採点されていません: {missing}")
-
-    out = []
-    for cid, c in by_id.items():
-        score = float(got[cid].get("score") or 0)
-        if score < 0 or score > c["maxscore"]:
-            clipped = min(max(score, 0.0), c["maxscore"])
-            log.warning("基準『%s』の点数 %g が範囲外のため %g に補正しました（満点 %g）",
-                        c["name"], score, clipped, c["maxscore"])
-            score = clipped
-        out.append({"criterionid": cid, "score": score,
-                    "remark": (got[cid].get("remark") or "")})
-    return out
 
 
 # ---------- メイン ----------
@@ -842,8 +820,13 @@ def main() -> None:
         log.warning("MOODLE_ALLOW_WRITE!=1 のため、このジョブは採点結果を Moodle に書き込みません（ドライラン）。")
 
     log.info("採点基準スプレッドシートを読み込み中（毎回最新化）...")
-    rubric_text = fetch_rubric_sheet_text()
-    ai_usage_rubric = load_ai_usage_rubric()
+    tabs = fetch_rubric_tabs()
+    ai_user = get_ai_user()
+    if CALIBRATE:
+        log.info("校正モード: 人が採点済みの提出を AI でも採点して比べます（Moodle には書き込みません）")
+    if REGRADE_TARGETS and ALLOW_WRITE:
+        # 採点済みの提出を書き換えることになるため、書き込みありでは受け付けない
+        log.error("REGRADE_TARGETS は書き込みなし（MOODLE_ALLOW_WRITE=0）のときだけ使えます。今回は無視します。")
 
     from anthropic import Anthropic
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -864,22 +847,35 @@ def main() -> None:
                 break
             # FIX: list_pending の処理状況を可視化
             try:
-                pending = list_pending(a["id"])
+                if CALIBRATE:
+                    pending = list_human_graded(a["id"], ai_user) if assignment_key(a["name"]) in RUBRIC_MAP else []
+                else:
+                    pending = list_pending(a["id"])
             except Exception as e:
                 log.error("list_pending failed course=%s assign=%s(%s): %s", course_id, a["id"], a["name"], e)
                 continue
-            forced = sorted(u for aid, u in REGRADE_TARGETS
-                            if aid == a["id"] and u not in {p["userid"] for p in pending})
-            if forced:
-                log.info("  再採点の指定: assign=%s user=%s", a["id"], forced)
-                pending = pending + [{"userid": u} for u in forced]
-            # FIX: pending 件数をログに出力して可視化
-            log.info("処理中: course=%s assign=%s(%s) pending=%d件（残枠%d）", course_id, a["id"], a["name"],
-                     len(pending), MAX_GRADE_PER_RUN - graded)
-            criteria = get_guide_criteria(a.get("cmid")) if pending else None
-            if criteria:
-                log.info("  評定ガイド: %s",
-                         " / ".join(f"{c['name']}({c['maxscore']:g}点)" for c in criteria))
+            if not CALIBRATE and not ALLOW_WRITE:
+                forced = sorted(u for aid, u in REGRADE_TARGETS
+                                if aid == a["id"] and u not in {p["userid"] for p in pending})
+                if forced:
+                    log.info("  再採点の指定（書き込みなし）: assign=%s user=%s", a["id"], forced)
+                    pending = pending + [{"userid": u} for u in forced]
+            log.info("処理中: course=%s assign=%s(%s) %s=%d件（残枠%d）", course_id, a["id"], a["name"],
+                     "人の採点済み" if CALIBRATE else "pending", len(pending), MAX_GRADE_PER_RUN - graded)
+            if not pending:
+                continue
+            criteria = get_guide_criteria(a.get("cmid"))
+            rubric, kinds, hold = rubric_for(a["name"], tabs, criteria)
+            if hold:
+                # 採点の根拠が確定しない課題は採点しない（講師が採点する）
+                for p in pending:
+                    skipped.append({"course": course_id, "assignment": a["id"],
+                                    "userid": p["userid"], "reason": hold})
+                log.warning("  採点保留（%s）: assign=%s(%s) %d件", hold, a["id"], a["name"], len(pending))
+                continue
+            log.info("  採点表: 「%s」%s 内容%g点・AI使用ログ%g点・減点項目%d個", rubric.tab,
+                     f"（{rubric.key}）", rubric.max_of(rb.CONTENT), rubric.max_of(rb.AI),
+                     len(rubric.items()))
             for p in pending:
                 if graded >= MAX_GRADE_PER_RUN:
                     # FIX: MAX到達時に詳細ログを出力して、どこで止まったか明確に
@@ -897,40 +893,54 @@ def main() -> None:
                     #   減点して0点近くを付けてしまう。採点も保存もせず未採点のまま残し、講師に回す
                     #   （一時的なダウンロード失敗なら翌日の実行で拾い直される）。
                     if sub["unreadable"]:
-                        skipped.append({"course": course_id, "assignment": a["id"],
-                                        "userid": userid, "unreadable": sub["unreadable"]})
+                        skipped.append({"course": course_id, "assignment": a["id"], "userid": userid,
+                                        "reason": "読めない提出ファイル", "unreadable": sub["unreadable"]})
                         log.warning("  採点保留（読めない提出ファイルあり・保存しない）: assign=%s(%s) "
                                     "user=%s %s", a["id"], a["name"], userid, sub["unreadable"])
                         continue
-                    result = grade_submission(client, rubric_text, ai_usage_rubric, a["name"],
-                                               sub["onlinetext"], sub["files"], criteria,
-                                               sub["file_text"], sub["unreadable"],
-                                               feedback_limit_for(a["name"]),
-                                               images=sub["images"])
-                    scores = None
-                    if criteria:
-                        scores = normalize_criteria_scores(result.get("criteria"), criteria)
-                        shown = "+".join(f"{s['score']:g}" for s in scores)
-                        total = sum(s["score"] for s in scores)
-                        grade_repr = f"{shown}={total:g}"
-                    else:
-                        grade_repr = f"{float(result['grade']):g}"
-                    # FIX(江尻指示 2026-08-29): 迷った採点は講評の一番上に「?」ブロックを出す。
-                    fb = prepend_uncertainty_note(result["feedback_html"], result, grade_repr)
+                    result = grade_submission(client, rubric, a["name"], sub["onlinetext"],
+                                              sub["files"], sub["file_text"], sub["images"])
+                    deductions = result["deductions"]
+                    unsure = [d for d in deductions if d.get("certain") is False]
+                    if unsure:
+                        result["needs_human_review"] = True
+                        lines = [f"・{rb.short_item_text(rubric.item(d['item_id']).text)}"
+                                 f"（−{rb.unit_of(rubric, rubric.item(d['item_id'])) * d['count']:g}点）"
+                                 for d in unsure]
+                        result["review_reason"] = ((result.get("review_reason") or "") +
+                            "\n厳しめに採点するため、判断が割れる次の減点も入れています。不要なら評定ガイドの"
+                            "該当基準の点数を戻し、基準欄の該当する減点理由を削除してください。\n" + "\n".join(lines)).strip()
+                    sc = rb.compute_scores(rubric, deductions)
+                    grademax = {k: c["maxscore"] for k, c in kinds.items()}
+                    # 講師と同じく、基準ごとの詳しい講評は評定ガイドの基準欄に、総評はフィードバック欄に入れる
+                    scores = [{"criterionid": kinds[k]["id"], "score": sc[k],
+                               "remark": rb.render_remark(rubric, k, deductions, sc, result,
+                                                          kinds[k]["maxscore"])} for k in kinds]
+                    grade_repr = "+".join(f"{sc[k]:g}" for k in kinds) + f"={sc['total']:g}"
+                    # 講評はコードが型に沿って組み立てる。迷った採点は一番上に「?」ブロックを出す。
+                    fb = prepend_uncertainty_note(
+                        rb.render_feedback(rubric, result, deductions, sc, grademax), result, grade_repr)
                     if result.get("needs_human_review"):
                         log.info("  ❓ 迷いあり: %s",
-                                 (result.get("review_reason") or "(理由なし)")[:200])
+                                 (result.get("review_reason") or "(理由なし)")[:300])
+                    if not ALLOW_WRITE:
+                        # ドライランのときだけ、保存しない講評を確認用にログへ出す
+                        log.info("  講評（ドライラン・保存しない）:\n%s\n--- 評定ガイドの基準欄 ---\n%s",
+                                 html_to_text(fb), "\n\n".join(c["remark"] for c in scores))
                     # FIX: 保存前に「採点結果」を出すと、保存で失敗しても成功したように見えるため
                     #      保存が終わってからログを出す。
                     if ALLOW_WRITE:
-                        save_grade_draft(a["id"], userid, course_id, fb,
-                                          grade=None if scores else float(result["grade"]),
-                                          criteria_scores=scores)
+                        save_grade_draft(a["id"], userid, course_id, fb, criteria_scores=scores)
                     log.info("採点保存%s: course=%s assign=%s(%s) user=%s grade=%s review=%s",
                              "" if ALLOW_WRITE else "(ドライラン)",
                              course_id, a["id"], a["name"], userid, grade_repr,
                              result.get("needs_human_review"))
+                    if CALIBRATE:
+                        diff = sc["total"] - p["human_grade"]
+                        log.info("  校正: AI %g点 / 人 %g点（差 %+g）減点 %s", sc["total"], p["human_grade"],
+                                 diff, [f"{d['item_id']}x{d['count']}" for d in deductions])
                     results.append({"course": course_id, "assignment": a["id"], "userid": userid,
+                                     "human_grade": p.get("human_grade"),
                                      "grade": grade_repr,
                                      "needs_human_review": result.get("needs_human_review"),
                                      "written": ALLOW_WRITE})
@@ -942,13 +952,13 @@ def main() -> None:
                     log.error("grading failed course=%s assign=%s(%s) user=%s: %s: %s", course_id,
                               a["id"], a["name"], userid, type(e).__name__, e)
 
-    log.info("完了: 保存%d件 / 失敗%d件 / 保留（読めないファイル）%d件。要レビュー: %d件",
+    log.info("完了: 保存%d件 / 失敗%d件 / 保留%d件。要レビュー: %d件",
              graded, len(failed), len(skipped),
              sum(1 for r in results if r.get("needs_human_review")))
     if failed:
         log.error("失敗した採点: %s", json.dumps(failed, ensure_ascii=False))
     if skipped:
-        log.warning("講師の採点が必要（読めない提出ファイル）: %s", json.dumps(skipped, ensure_ascii=False))
+        log.warning("講師の採点が必要（保留）: %s", json.dumps(skipped, ensure_ascii=False))
     print(json.dumps({"graded": graded, "failed": failed, "skipped": skipped, "results": results},
                      ensure_ascii=False))
 
