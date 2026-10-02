@@ -451,10 +451,12 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
     """採点表の減点項目だけを選べるツール定義。項目IDは enum で縛り、表に無い減点を構造的に防ぐ。"""
     fb_props = {
         "strengths": {"type": "array", "items": {"type": "string"},
-                      "description": "評価できる点を2〜3個。提出物のどこが良いかを具体的に。1個1論点・2〜3文まで・です／ます調"},
+                      "description": "評価できる点を3個。提出物のどこが、なぜ良いかを具体的に（引用や箇所を示す）。"
+                                     "1個1論点・2〜3文・です／ます調"},
         "suggestions": {"type": "array", "items": {"type": "string"},
                         "description": "さらに良くするための提案を0〜2個。減点しない観点はここに書く。"
-                                       "改善点だけを書き、褒める内容は strengths に書く。1個1論点・2〜3文まで"},
+                                       "改善点だけを書き、褒める内容は strengths に書く。何をどう直すと良いかを具体的に。"
+                                       "1個1論点・2〜3文。2〜3個"},
     }
     ai_ids = [i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI]
     return {
@@ -473,13 +475,16 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                             "count": {"type": "integer", "minimum": 1,
                                       "description": "「1項目につき」「1か所につき」の項目は該当した件数。それ以外は1"},
                             "reason": {"type": "string",
-                                       "description": "受講生向けに、なぜ該当するかを1〜2文で。です／ます調"},
+                                       "description": "受講生向けに、なぜ該当するかと、次にどう直せばよいかを2〜3文で。です／ます調"},
+                            "certain": {"type": "boolean",
+                                        "description": "提出物で確実に該当と言えるなら true。判断が割れるが該当の可能性がある場合も"
+                                                       "減点に入れ、false にする（講師が確認して不要なら削除する）"},
                             "quote": {"type": "string",
                                       "description": "根拠となる提出物の記述をそのまま40字以内で引用"},
                             "location": {"type": "string",
                                          "description": "引用元（例：企画レポート.pptx スライド3、AI使用ログ 節目2）"},
                         },
-                        "required": ["item_id", "count", "reason", "quote", "location"],
+                        "required": ["item_id", "count", "reason", "quote", "location", "certain"],
                     },
                 },
                 # FIX(2026-09-29): AI使用ログの項目は見落としが出たため（講師が付けた −1 を2件見逃した）、
@@ -555,7 +560,10 @@ def rubric_prompt(rubric: rb.Rubric) -> str:
 
 STYLE_RULES = (
     "【講評の書き方（受講生が読む）】\n"
-    "- です／ます調。1文はなるべく60字以内、1つの箇条は2〜3文まで。1つの箇条に1つの論点だけを書く。\n"
+    "- です／ます調。1文はなるべく60字以内、1つの箇条は2〜3文。1つの箇条に1つの論点だけを書く。\n"
+    "- 講師は、AIの講評から不要な部分を削って使う。足りない説明を講師が書き足すより、削るほうが負担が少ないので、"
+    "説明は多めに書く。基準（内容／AI使用ログ）ごとに、評価できる点・減点理由・さらに良くするなら を合わせて"
+    "400〜600字を目安にする。\n"
     "- 受講生が知らない採点の内部用語を使わない（採点者A/B/C、合議、節目平均、内部修正点、"
     "外部追加点、整形明示、ルーブリック、§、項目ID など）。\n"
     "- 提出物を引用するときは「」でくくり、40字以内にする。\n"
@@ -594,8 +602,11 @@ def _system(rubric: rb.Rubric, stance: str = "") -> str:
         "【採点のしかた（必ず従うこと）】\n"
         "- 減点は、下の一覧にある項目だけから選ぶ。一覧に無い観点では減点しない。\n"
         "- 減点するときは、該当を立証する提出物の記述を quote に引用する。引用で立証できない減点はしない。\n"
-        "- 該当する項目は見逃さずに拾う（厳しめに採点する）。一方で、一覧のどの項目にも該当しなければ満点でよい。\n"
-        "- 一覧に無い改善点・物足りない点は、減点せず feedback の suggestions に書く。\n"
+        "- 厳しめに採点する。該当する項目は見逃さずに拾う。判断が割れるが該当の可能性がある項目も減点に入れ、"
+        "certain=false にする（講師は、見逃しを探して減点を足すより、不要な減点を削るほうが負担が少ない）。"
+        "一覧のどの項目にも該当しなければ満点でよい。\n"
+        "- 一覧に無い改善点・物足りない点は、減点せず feedback の suggestions（さらに良くするなら）に、"
+        "何をどう直すと良いかまで具体的に書く。\n"
         "- 点数はシステムが計算する。点数や合計を文章に書かない。\n"
         "- 回答内容の項目は提出ファイルの本文を根拠にする。AI使用ログの項目は、オンラインテキストのAI使用ログを根拠にする。\n"
         "- 減点項目への該当判断が割れるとき、機密配慮違反の疑いがあるときは needs_human_review=true にする。\n\n"
@@ -642,6 +653,11 @@ def _call_tool(client, system: str, content, tool: dict) -> tuple[dict | None, s
     return None, resp.stop_reason
 
 
+# 長さの不足は直させるが、直らなくても要確認にはしない（採点の正しさとは別の問題のため）
+SOFT = "[長さ] "
+MIN_COMMENT_CHARS = int(os.environ.get("MIN_COMMENT_CHARS", "300"))
+
+
 def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], list[str]]:
     """モデルの出力を検証する。戻り値は (採用する減点, 問題点)。"""
     if result is None:
@@ -675,6 +691,14 @@ def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], li
         problems.append(f"ai_checks で「該当」とした項目 {sorted(hit_ids - deducted)} を deductions に入れていない、"
                         f"または「非該当」の項目 {sorted(deducted - hit_ids)} を減点している。"
                         "「該当」と判断した項目は、提出物の引用をつけて deductions に入れること")
+    for kind in (rb.CONTENT, rb.AI):
+        f = fb.get(kind) or {}
+        n = sum(len(t) for k in ("strengths", "suggestions") for t in (f.get(k) or []) if isinstance(t, str))
+        n += sum(len(d.get("reason") or "") for d in deductions
+                 if rubric.section_of(rubric.item(d["item_id"])).kind == kind)
+        if n < MIN_COMMENT_CHARS:
+            problems.append(f"{SOFT}{rb.KIND_LABEL[kind]}のコメントが短い（{n}字）。"
+                            "評価できる点・減点理由・さらに良くするなら を合わせて400〜600字を目安に、具体的に書き足すこと")
     hit = rb.forbidden_in(texts)
     if hit:
         problems.append(f"受講生向けの文に内部用語: {hit}")
@@ -701,9 +725,11 @@ def _grade_once(client, rubric: rb.Rubric, assignment_name: str, onlinetext: str
         raise RuntimeError(f"採点出力が得られませんでした: {problems}")
     result = fill_defaults(result)
     result["deductions"] = deductions
-    result["needs_human_review"] = True
-    result["review_reason"] = ((result.get("review_reason") or "") +
-                               "\n(システム) 採点出力の検証で問題が残りました: " + " / ".join(problems)).strip()
+    hard = [p for p in problems if not p.startswith(SOFT)]
+    if hard:
+        result["needs_human_review"] = True
+        result["review_reason"] = ((result.get("review_reason") or "") +
+                                   "\n(システム) 採点出力の検証で問題が残りました: " + " / ".join(hard)).strip()
     return result
 
 
@@ -744,8 +770,9 @@ def synthesize(client, rubric: rb.Rubric, drafts: list[tuple[str, dict]], assign
     system = _system(rubric) + (
         "\n【あなたの役割】3名の採点者が独立に付けた減点案を突き合わせ、最終案を1本にまとめる。\n"
         "- 各減点は、引用が本当にその項目に該当するかを提出物で確かめてから採る。人数では決めない。\n"
-        "- 2名以上が「該当」と判断した項目は、提出物を読んで該当しないと言い切れない限り減点する（厳しめに採点する）。\n"
-        "- 1名だけが「該当」と判断した項目は、引用が項目の文言（と講師の解釈）に直接当たるときだけ減点する。\n"
+        "- 誰か1名でも「該当」と判断した項目は、提出物を読んで該当しないと言い切れない限り減点に入れる（厳しめに採点する。"
+        "不要な減点は講師が削除する）。\n"
+        "- 2名以上が該当とし、提出物でも確かめられた減点は certain=true、1名だけ・判断が割れる減点は certain=false にする。\n"
         "- 3名の判断が割れ、提出物でも決めきれない減点があれば needs_human_review=true にし、"
         "review_reason に理由を書く。\n"
         "- 評価できる点・改善提案は3案から重複を除いて選び直す。採点者が複数いたことは受講生向けの文に書かない。\n"
@@ -755,7 +782,7 @@ def synthesize(client, rubric: rb.Rubric, drafts: list[tuple[str, dict]], assign
     for attempt in (1, 2):
         result, stop = _call_tool(client, system, user, tool)
         deductions, problems = check_result(rubric, result)
-        if not problems:
+        if not problems or (attempt == 2 and all(p.startswith(SOFT) for p in problems)):
             log.info("  合議 統合: 減点 %s", [f"{x['item_id']}x{x['count']}" for x in deductions])
             return {**fill_defaults(result), "deductions": deductions}
         log.warning("統合の出力に問題 (%d回目, stop=%s): %s", attempt, stop, problems)
@@ -869,6 +896,15 @@ def main() -> None:
                     result = grade_submission(client, rubric, a["name"], sub["onlinetext"],
                                               sub["files"], sub["file_text"], sub["images"])
                     deductions = result["deductions"]
+                    unsure = [d for d in deductions if d.get("certain") is False]
+                    if unsure:
+                        result["needs_human_review"] = True
+                        lines = [f"・{rb.short_item_text(rubric.item(d['item_id']).text)}"
+                                 f"（−{rb.unit_of(rubric, rubric.item(d['item_id'])) * d['count']:g}点）"
+                                 for d in unsure]
+                        result["review_reason"] = ((result.get("review_reason") or "") +
+                            "\n厳しめに採点するため、判断が割れる次の減点も入れています。不要なら評定ガイドの"
+                            "該当基準の点数を戻し、基準欄の該当する減点理由を削除してください。\n" + "\n".join(lines)).strip()
                     sc = rb.compute_scores(rubric, deductions)
                     grademax = {k: c["maxscore"] for k, c in kinds.items()}
                     # 講師と同じく、基準ごとの詳しい講評は評定ガイドの基準欄に、総評はフィードバック欄に入れる

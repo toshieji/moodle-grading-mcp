@@ -105,13 +105,14 @@ def test_validate() -> None:
     _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear[:-1]})
     check(any("確認していない項目" in p for p in problems), "AI使用ログの項目を1つでも確認していなければ直させる")
     _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": all_clear})
-    check(not problems, "全項目を確認し、該当なしなら問題なし")
+    check(not [p for p in problems if not p.startswith(gj.SOFT)], "全項目を確認し、該当なしなら（長さ以外の）問題なし")
+    check(any(p.startswith(gj.SOFT) for p in problems), "コメントが短ければ書き足させる（長さの問題として区別）")
     flagged = [{**c, "verdict": "該当"} if c["item_id"] == log_item.id else c for c in all_clear]
     _, problems = gj.check_result(r, {"deductions": [], "feedback": {}, "ai_checks": flagged})
     check(any("deductions に入れていない" in p for p in problems), "「該当」としたのに減点していなければ直させる")
     ded = [{"item_id": log_item.id, "count": 1, "quote": "プロンプト：", "reason": "出力の記録がありません。"}]
     _, problems = gj.check_result(r, {"deductions": ded, "feedback": {}, "ai_checks": flagged})
-    check(not problems, "「該当」と減点が一致していれば問題なし")
+    check(not [p for p in problems if not p.startswith(gj.SOFT)], "「該当」と減点が一致していれば（長さ以外の）問題なし")
     _, problems = gj.check_result(r, {"deductions": ["r5"], "feedback": {"content": "良い"}, "ai_checks": []})
     check(bool(problems), "型の崩れた出力は落ちずに問題として返す")
     text = gj.rubric_prompt(r)
@@ -143,6 +144,8 @@ def test_render() -> None:
     check(fb.count("<p>") >= 3, "総評は段落ごとに分ける")
     check(not rb.forbidden_in([content, ai, fb]), "内部用語を含まない")
     check(rb.render_remark(r, rb.AI, ded, sc) == "減点なし", "講評なしの呼び出しは減点一覧（後方互換）")
+    unsure = [{**ded[0], "certain": False}]
+    check("【講師確認】" in rb.render_remark(r, rb.CONTENT, unsure, sc, result, 15), "判断が割れる減点に講師確認の印")
 
 
 def test_main_holds() -> None:

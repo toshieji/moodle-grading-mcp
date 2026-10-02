@@ -261,13 +261,14 @@ def render_criterion(rubric: Rubric, kind: str, result: dict, deductions: list[d
         it = rubric.item(d["item_id"])
         pts = unit_of(rubric, it) * d["count"]
         cnt = f"・{d['count']}件" if d["count"] > 1 else ""
-        out += ["", f"△ 減点理由：{short_item_text(it.text)}（−{_fmt(pts)}点{cnt}）",
+        mark = "【講師確認】" if d.get("certain") is False else ""
+        out += ["", f"△ 減点理由：{short_item_text(it.text)}（−{_fmt(pts)}点{cnt}）{mark}",
                 (d.get("reason") or "").strip()]
         quote = (d.get("quote") or "").strip()
         if quote:
             loc = (d.get("location") or "").strip()
             out.append(f"該当箇所{('（' + loc + '）') if loc else ''}：「{quote}」")
-    tips = _lines(fb.get("suggestions"))[:2]
+    tips = _lines(fb.get("suggestions"))[:3]
     if tips:
         out += ["", f"△ {SUGGEST_LABEL}"] + [f"・{t}" for t in tips]
         out.append("※採点基準上の減点事項ではありません。")
