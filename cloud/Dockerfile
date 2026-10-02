@@ -8,5 +8,6 @@ COPY grading_job.py .
 # 提出ファイルの本文・画像抽出（リポジトリ直下の extract.py。deploy.sh がビルド前に同梱する）
 COPY extract.py .
 COPY rubric.py .
+COPY instructor_notes.json .
 
 ENTRYPOINT ["python", "grading_job.py"]

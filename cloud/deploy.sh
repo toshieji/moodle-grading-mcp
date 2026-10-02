@@ -60,7 +60,7 @@ gcloud artifacts repositories describe moodle-grading --project "$PROJECT" --loc
   gcloud artifacts repositories create moodle-grading --project "$PROJECT" --location "$REGION" --repository-format=docker
 # extract.py はリポジトリ直下（MCP サーバと共用）にあるため、cloud/ と合わせた一時ディレクトリでビルドする。
 BUILD_DIR="$(mktemp -d)"
-cp "$HERE"/Dockerfile "$HERE"/requirements.txt "$HERE"/grading_job.py "$HERE"/rubric.py "$BUILD_DIR"/
+cp "$HERE"/Dockerfile "$HERE"/requirements.txt "$HERE"/grading_job.py "$HERE"/rubric.py "$HERE"/instructor_notes.json "$BUILD_DIR"/
 cp "$HERE"/../extract.py "$BUILD_DIR"/
 gcloud builds submit "$BUILD_DIR" --project "$PROJECT" --tag "$IMAGE"
 rm -rf "$BUILD_DIR"

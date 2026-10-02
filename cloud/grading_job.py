@@ -82,6 +82,12 @@ REGRADE_TARGETS = {
     (int(a), int(u)) for a, u in
     (t.strip().split(":", 1) for t in os.environ.get("REGRADE_TARGETS", "").split(",") if ":" in t)
 }
+# 校正モード（2026-10-03 江尻指示「人の採点を参考に学習する。決して上書きしない」）。
+#   人（AI のトークン以外の採点者）が採点済みの提出を AI でも採点し、点数を比べてログに出すだけ。
+#   このモードでは MOODLE_ALLOW_WRITE に関係なく、Moodle へは一切書き込まない。
+CALIBRATE = os.environ.get("CALIBRATE", "0") == "1"
+if CALIBRATE:
+    ALLOW_WRITE = False
 # 1提出あたりモデルに渡す画像の上限（図・スクリーンショット。コストと入力上限のため）
 MAX_IMAGES_PER_SUBMISSION = int(os.environ.get("MAX_IMAGES_PER_SUBMISSION", "20"))
 
@@ -184,6 +190,33 @@ def get_guide_criteria(cmid: int | None) -> list[dict] | None:
             if crits:
                 return crits
     return None
+
+
+def current_grades(assignid: int) -> dict[int, tuple[float | None, int | None]]:
+    """課題の現在の評点 {userid: (評点 または None, 採点者)}。未採点（-1・空）は None。"""
+    out: dict[int, tuple[float | None, int | None]] = {}
+    for a in _call("mod_assign_get_grades", {"assignmentids[0]": assignid}).get("assignments", []):
+        for g in a.get("grades", []):
+            try:
+                v = float(g.get("grade"))
+            except (TypeError, ValueError):
+                v = None
+            grader = g.get("grader")
+            out[g["userid"]] = (v if v is not None and v >= 0 else None,
+                                int(grader) if str(grader).lstrip("-").isdigit() else None)
+    return out
+
+
+def get_ai_user() -> int:
+    """このジョブ（AI）が使う Moodle アカウントのユーザーID。これ以外の採点者は人として扱う。"""
+    return int(_call("core_webservice_get_site_info", {})["userid"])
+
+
+def list_human_graded(assignid: int, ai_user: int) -> list[dict]:
+    """人（AI のトークン以外）が採点済みの提出。校正モードの対象。"""
+    return [{"userid": u, "human_grade": v, "grader": g}
+            for u, (v, g) in current_grades(assignid).items()
+            if v is not None and g not in (None, ai_user)]
 
 
 def list_pending(assignid: int) -> list[dict]:
@@ -302,6 +335,12 @@ def save_grade_draft(assignid: int, userid: int, course_id: str, feedback_html: 
         raise RuntimeError("write disabled: MOODLE_ALLOW_WRITE!=1")
     if str(course_id) not in WRITE_COURSES:
         raise RuntimeError(f"course {course_id} not in allowlist {sorted(WRITE_COURSES)}")
+    # FIX(2026-10-03 江尻指示): 採点済みの提出は決して上書きしない。人の採点か AI の採点かを
+    #   Moodle 上で見分けられない場合があるため（江尻のアカウントで手で採点することもある）、
+    #   採点が入っている提出には一切書き込まない。保存の直前に読み直して確かめる。
+    existing, grader = current_grades(assignid).get(userid, (None, None))
+    if existing is not None:
+        raise RuntimeError(f"採点済み（{existing:g}点・採点者 {grader}）のため上書きしません")
     fb = feedback_html or ""
     if _FOOTER_MARK not in fb:
         fb += _footer()
@@ -322,7 +361,8 @@ def save_grade_draft(assignid: int, userid: int, course_id: str, feedback_html: 
             params[f"{base}[fillings][0][criterionid]"] = cs["criterionid"]
             params[f"{base}[fillings][0][score]"] = cs["score"]
             params[f"{base}[fillings][0][remark]"] = cs.get("remark", "")
-            params[f"{base}[fillings][0][remarkformat]"] = 1
+            # 改行を残すため書式はプレーンテキスト（FORMAT_PLAIN=2。HTML=1 だと改行が消える）
+            params[f"{base}[fillings][0][remarkformat]"] = 2
     else:
         params["grade"] = grade
     _call("mod_assign_save_grade", params)
@@ -411,10 +451,10 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
     """採点表の減点項目だけを選べるツール定義。項目IDは enum で縛り、表に無い減点を構造的に防ぐ。"""
     fb_props = {
         "strengths": {"type": "array", "items": {"type": "string"},
-                      "description": "評価できる点を2〜3個。1個1論点・1文60字以内・です／ます調"},
+                      "description": "評価できる点を2〜3個。提出物のどこが良いかを具体的に。1個1論点・2〜3文まで・です／ます調"},
         "suggestions": {"type": "array", "items": {"type": "string"},
                         "description": "さらに良くするための提案を0〜2個。減点しない観点はここに書く。"
-                                       "改善点だけを書き、褒める内容は strengths に書く。1個1論点・1文60字以内"},
+                                       "改善点だけを書き、褒める内容は strengths に書く。1個1論点・2〜3文まで"},
     }
     ai_ids = [i.id for i in rubric.items() if rubric.section_of(i).kind == rb.AI]
     return {
@@ -464,7 +504,9 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                                    rb.AI: {"type": "object", "properties": fb_props}},
                     "required": [rb.CONTENT, rb.AI],
                 },
-                "closing": {"type": "string", "description": "次の課題に向けた一言（1文・60字以内）"},
+                "summary": {"type": "string",
+                            "description": "総評。内容とAI使用ログを通した全体の評価と、次に意識してほしいことを2〜4文で。"
+                                           "点数は書かない。です／ます調"},
                 "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                 "needs_human_review": {"type": "boolean",
                                        "description": "減点項目への該当判断が割れる・機密配慮違反の疑いがあるときだけ true"},
@@ -475,24 +517,23 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                                    " を、それぞれ改行して書く。",
                 },
             },
-            "required": ["deductions", "ai_checks", "feedback", "closing", "confidence",
+            "required": ["deductions", "ai_checks", "feedback", "summary", "confidence",
                          "needs_human_review"],
         },
     }
 
 
-# 減点項目の解釈（講師の判断）。項目の文言を広く読んで見逃すことがあったため、講師が実際に
-# 減点した判断を項目ごとの注記としてモデルに渡す。キーは項目の文言に含まれる語。
-# 出典: 2026-09-28 講師レビュー（受講生別採点表の「講師AI採点レビュー」「講師評価コメント」）
-ITEM_NOTES = {
-    "会話ログ": "プロンプトとAIの出力の要約の両方が必要。プロンプトだけで、AIが何を出力したかの記録が無ければ該当する。",
-    "外部追加の出所": "主張（例：以前は〜だった、という変化）を裏付ける記録が無い場合、"
-                   "本人が「記録を残していない」と書いている場合も該当する。"
-                   "一方、本人の業務経験・体験は出所として認める（「出所：自分の業務経験」と書かれていれば該当しない）。",
-    "外部追加が2つに満たない": "【外部追加】として書かれた件数だけで判断する。2件以上あれば、内容の具体性や"
-                        "設問ごとの有無にかかわらず該当しない（具体性は他の項目や改善提案で扱う）。",
-    "内部修正が3つに満たない": "【修正】として書かれた件数だけで判断する。3件以上あれば、内容の質にかかわらず該当しない。",
-}
+# 減点項目の解釈（講師の採点から学んだもの）。項目の文言を広く読んで見逃したり、基準外の観点で
+# 減点したりしないよう、講師が実際に減点した／しなかった判断を項目の注記としてモデルに渡す。
+# 講師採点が増えたら instructor_notes.json に1行ずつ足す（コードは変えない）。
+_NOTES_PATH = os.environ.get("INSTRUCTOR_NOTES_PATH", os.path.join(_HERE, "instructor_notes.json"))
+try:
+    with open(_NOTES_PATH, encoding="utf-8") as _f:
+        _NOTES = json.load(_f)
+except OSError:
+    _NOTES = {}
+ITEM_NOTES: dict[str, str] = _NOTES.get("items", {})
+GENERAL_NOTES: list[str] = _NOTES.get("general", [])
 
 
 def item_note(text: str) -> str:
@@ -514,7 +555,7 @@ def rubric_prompt(rubric: rb.Rubric) -> str:
 
 STYLE_RULES = (
     "【講評の書き方（受講生が読む）】\n"
-    "- です／ます調。1文は60字以内。1つの箇条に1つの論点だけを書く。\n"
+    "- です／ます調。1文はなるべく60字以内、1つの箇条は2〜3文まで。1つの箇条に1つの論点だけを書く。\n"
     "- 受講生が知らない採点の内部用語を使わない（採点者A/B/C、合議、節目平均、内部修正点、"
     "外部追加点、整形明示、ルーブリック、§、項目ID など）。\n"
     "- 提出物を引用するときは「」でくくり、40字以内にする。\n"
@@ -567,6 +608,8 @@ def _system(rubric: rb.Rubric, stance: str = "") -> str:
         "  (d) ログに書かれた修正が、提出物に反映されているか\n"
         "- ai_checks で「該当」とした項目は、必ず deductions にも入れる。「非該当」とした項目は deductions に入れない。\n\n"
         f"{STYLE_RULES}\n"
+        + ("【講師の採点の傾向（過去の講師採点から）】\n" + "".join(f"- {n}\n" for n in GENERAL_NOTES) + "\n"
+           if GENERAL_NOTES else "") +
         f"=== 採点表「{rubric.tab}」の減点項目（{rubric.key}） ===\n{rubric_prompt(rubric)}\n"
     )
 
@@ -617,7 +660,7 @@ def check_result(rubric: rb.Rubric, result: dict | None) -> tuple[list[dict], li
     deductions, bad = rb.validate_deductions(rubric, result.get("deductions"))
     problems += bad
     fb = result.get("feedback") or {}
-    texts = [result.get("closing") or ""]
+    texts = [result.get("summary") or ""]
     texts += [t for k in (rb.CONTENT, rb.AI) for f in ("strengths", "suggestions")
               for t in ((fb.get(k) or {}).get(f) or [])]
     texts += [d.get("reason") or "" for d in deductions]
@@ -746,6 +789,12 @@ def main() -> None:
 
     log.info("採点基準スプレッドシートを読み込み中（毎回最新化）...")
     tabs = fetch_rubric_tabs()
+    ai_user = get_ai_user()
+    if CALIBRATE:
+        log.info("校正モード: 人が採点済みの提出を AI でも採点して比べます（Moodle には書き込みません）")
+    if REGRADE_TARGETS and ALLOW_WRITE:
+        # 採点済みの提出を書き換えることになるため、書き込みありでは受け付けない
+        log.error("REGRADE_TARGETS は書き込みなし（MOODLE_ALLOW_WRITE=0）のときだけ使えます。今回は無視します。")
 
     from anthropic import Anthropic
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -766,18 +815,21 @@ def main() -> None:
                 break
             # FIX: list_pending の処理状況を可視化
             try:
-                pending = list_pending(a["id"])
+                if CALIBRATE:
+                    pending = list_human_graded(a["id"], ai_user) if assignment_key(a["name"]) in RUBRIC_MAP else []
+                else:
+                    pending = list_pending(a["id"])
             except Exception as e:
                 log.error("list_pending failed course=%s assign=%s(%s): %s", course_id, a["id"], a["name"], e)
                 continue
-            forced = sorted(u for aid, u in REGRADE_TARGETS
-                            if aid == a["id"] and u not in {p["userid"] for p in pending})
-            if forced:
-                log.info("  再採点の指定: assign=%s user=%s", a["id"], forced)
-                pending = pending + [{"userid": u} for u in forced]
-            # FIX: pending 件数をログに出力して可視化
-            log.info("処理中: course=%s assign=%s(%s) pending=%d件（残枠%d）", course_id, a["id"], a["name"],
-                     len(pending), MAX_GRADE_PER_RUN - graded)
+            if not CALIBRATE and not ALLOW_WRITE:
+                forced = sorted(u for aid, u in REGRADE_TARGETS
+                                if aid == a["id"] and u not in {p["userid"] for p in pending})
+                if forced:
+                    log.info("  再採点の指定（書き込みなし）: assign=%s user=%s", a["id"], forced)
+                    pending = pending + [{"userid": u} for u in forced]
+            log.info("処理中: course=%s assign=%s(%s) %s=%d件（残枠%d）", course_id, a["id"], a["name"],
+                     "人の採点済み" if CALIBRATE else "pending", len(pending), MAX_GRADE_PER_RUN - graded)
             if not pending:
                 continue
             criteria = get_guide_criteria(a.get("cmid"))
@@ -819,8 +871,10 @@ def main() -> None:
                     deductions = result["deductions"]
                     sc = rb.compute_scores(rubric, deductions)
                     grademax = {k: c["maxscore"] for k, c in kinds.items()}
+                    # 講師と同じく、基準ごとの詳しい講評は評定ガイドの基準欄に、総評はフィードバック欄に入れる
                     scores = [{"criterionid": kinds[k]["id"], "score": sc[k],
-                               "remark": rb.render_remark(rubric, k, deductions, sc)} for k in kinds]
+                               "remark": rb.render_remark(rubric, k, deductions, sc, result,
+                                                          kinds[k]["maxscore"])} for k in kinds]
                     grade_repr = "+".join(f"{sc[k]:g}" for k in kinds) + f"={sc['total']:g}"
                     # 講評はコードが型に沿って組み立てる。迷った採点は一番上に「?」ブロックを出す。
                     fb = prepend_uncertainty_note(
@@ -830,8 +884,8 @@ def main() -> None:
                                  (result.get("review_reason") or "(理由なし)")[:300])
                     if not ALLOW_WRITE:
                         # ドライランのときだけ、保存しない講評を確認用にログへ出す
-                        log.info("  講評（ドライラン・保存しない）:\n%s\n  評定ガイドのコメント: %s",
-                                 html_to_text(fb), [c["remark"] for c in scores])
+                        log.info("  講評（ドライラン・保存しない）:\n%s\n--- 評定ガイドの基準欄 ---\n%s",
+                                 html_to_text(fb), "\n\n".join(c["remark"] for c in scores))
                     # FIX: 保存前に「採点結果」を出すと、保存で失敗しても成功したように見えるため
                     #      保存が終わってからログを出す。
                     if ALLOW_WRITE:
@@ -840,7 +894,12 @@ def main() -> None:
                              "" if ALLOW_WRITE else "(ドライラン)",
                              course_id, a["id"], a["name"], userid, grade_repr,
                              result.get("needs_human_review"))
+                    if CALIBRATE:
+                        diff = sc["total"] - p["human_grade"]
+                        log.info("  校正: AI %g点 / 人 %g点（差 %+g）減点 %s", sc["total"], p["human_grade"],
+                                 diff, [f"{d['item_id']}x{d['count']}" for d in deductions])
                     results.append({"course": course_id, "assignment": a["id"], "userid": userid,
+                                     "human_grade": p.get("human_grade"),
                                      "grade": grade_repr,
                                      "needs_human_review": result.get("needs_human_review"),
                                      "written": ALLOW_WRITE})

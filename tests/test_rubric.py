@@ -79,7 +79,7 @@ def test_scores() -> None:
 
     r21 = R("事前課題2-1：事業分析", 25, 25)
     shared = next(i for i in r21.items() if r21.section_of(i).shared and i.unit == 20)
-    check(rb.unit_of(r21, shared) == 10, "全体で1回判定の −20 は 2-1（AI 25/50点）では −10 に按分")
+    check(rb.unit_of(r21, shared) == 20, "全体で1回判定の減点は按分しない（講師は 2-1 でも −10 をそのまま引いている）")
 
 
 def test_validate() -> None:
@@ -119,7 +119,7 @@ def test_validate() -> None:
 
 
 def test_render() -> None:
-    print("講評の型")
+    print("講評の型（講師と同じく、基準欄に詳細・フィードバック欄に総評）")
     r = R("事前課題3：ナレッジ記事", 15, 15)
     typo = next(i for i in r.items() if "誤字" in i.text and r.section_of(i).kind == rb.CONTENT)
     ded = [{"item_id": typo.id, "count": 2, "reason": "表記の誤りが2か所あります。",
@@ -127,17 +127,22 @@ def test_render() -> None:
     result = {"feedback": {"content": {"strengths": ["ペルソナと記事の読者がつながっています。"],
                                        "suggestions": ["計測条件を完全一致にすると確実です。"]},
                            "ai": {"strengths": ["修正の理由が具体的です。"]}},
-              "closing": "次の課題でもこの調子で進めてください。"}
+              "summary": "記事企画から計測まで一貫しています。\n次は計測条件の精度を意識してください。"}
     sc = rb.compute_scores(r, ded)
-    html = rb.render_feedback(r, result, ded, sc, {rb.CONTENT: 15, rb.AI: 15})
-    check("【内容：13点／15点】" in html and "【AI使用ログ：15点／15点】" in html, "基準ごとの見出しに点数")
-    check("△ 減点理由（−2点）" in html, "減点理由の見出しの点数が保存する点数と一致する")
-    check(html.count("△ 減点理由") == 1, "減点の無い基準には減点理由の欄を出さない")
-    check("<ul>" in html and "<li>" in html and "\n" in html, "箇条書きと改行の構造を残す")
-    check("減点事項ではありません" in html, "改善提案は減点ではないと明記する")
-    check("合計：28点／30点" in html, "合計の行")
-    check(not rb.forbidden_in([html]), "内部用語を含まない")
-    check(rb.render_remark(r, rb.AI, ded, sc) == "減点なし", "減点の無い基準のコメントは「減点なし」")
+    content = rb.render_remark(r, rb.CONTENT, ded, sc, result, 15)
+    ai = rb.render_remark(r, rb.AI, ded, sc, result, 15)
+    check(content.startswith("【内容：13点／15点】") and ai.startswith("【AI使用ログ：15点／15点】"),
+          "基準欄の見出しに点数")
+    check("△ 減点理由：誤字脱字がある（−2点・2件）" in content, "減点理由の見出しに項目名・点数・件数")
+    check("該当箇所（記事原稿.docx）：「ウェブ解析士の資格を習得」" in content, "減点理由に引用")
+    check("△ 減点理由" not in ai, "減点の無い基準には減点理由を出さない")
+    check("△ さらに良くするなら" in content and "減点事項ではありません" in content, "改善提案は減点ではないと明記")
+    check("\n" in content and "<" not in content, "基準欄は改行つきのプレーンテキスト")
+    fb = rb.render_feedback(r, result, ded, sc, {rb.CONTENT: 15, rb.AI: 15})
+    check("【採点結果：28点／30点】" in fb and "内容 13点／15点" in fb, "フィードバック欄に合計と内訳")
+    check(fb.count("<p>") >= 3, "総評は段落ごとに分ける")
+    check(not rb.forbidden_in([content, ai, fb]), "内部用語を含まない")
+    check(rb.render_remark(r, rb.AI, ded, sc) == "減点なし", "講評なしの呼び出しは減点一覧（後方互換）")
 
 
 def test_main_holds() -> None:
@@ -146,6 +151,7 @@ def test_main_holds() -> None:
     graded: list = []
     patches = {
         "fetch_rubric_tabs": lambda: TABS,
+        "get_ai_user": lambda: 10,
         "list_assignments": lambda cid: [{"id": 10, "cmid": 20, "name": "中間課題2：計画書"},
                                          {"id": 11, "cmid": 21, "name": "事前課題3：記事"}],
         "list_pending": lambda aid: [{"userid": 1}],
@@ -174,6 +180,71 @@ def test_main_holds() -> None:
     check(saved and [c["score"] for c in saved[0][1]] == [15, 15], "減点なしなら評定ガイドの両基準とも満点で保存")
 
 
+def test_never_overwrite() -> None:
+    """採点済みの提出は決して上書きしない（2026-10-03 江尻指示）。"""
+    print("採点済みの提出を上書きしない")
+    calls: list = []
+    orig = (gj.current_grades, gj._call, gj.ALLOW_WRITE, gj.WRITE_COURSES)
+    gj._call = lambda fn, params: calls.append(fn) or {}
+    gj.ALLOW_WRITE, gj.WRITE_COURSES = True, {"900"}
+    try:
+        gj.current_grades = lambda aid: {5: (19.0, 654)}
+        try:
+            gj.save_grade_draft(11, 5, "900", "<p>x</p>", criteria_scores=[{"criterionid": 1, "score": 1}])
+            refused = False
+        except RuntimeError as e:
+            refused = "上書きしません" in str(e)
+        check(refused and "mod_assign_save_grade" not in calls, "人が採点済みなら保存を拒否し、Moodle に送らない")
+        gj.current_grades = lambda aid: {5: (19.0, 10)}
+        try:
+            gj.save_grade_draft(11, 5, "900", "<p>x</p>", criteria_scores=[{"criterionid": 1, "score": 1}])
+            refused = False
+        except RuntimeError:
+            refused = True
+        check(refused and "mod_assign_save_grade" not in calls, "AI のアカウントで採点済みでも上書きしない")
+    finally:
+        gj.current_grades, gj._call, gj.ALLOW_WRITE, gj.WRITE_COURSES = orig
+
+
+def _run_main(patches: dict, **flags) -> None:
+    import types
+    sys.modules.setdefault("anthropic", types.SimpleNamespace(Anthropic=lambda api_key: object()))
+    saved_flags = {k: getattr(gj, k) for k in flags}
+    originals = {k: getattr(gj, k) for k in patches}
+    for k, v in {**patches, **flags}.items():
+        setattr(gj, k, v)
+    try:
+        gj.main()
+    finally:
+        for k, v in {**originals, **saved_flags}.items():
+            setattr(gj, k, v)
+
+
+def test_regrade_and_calibrate() -> None:
+    print("再採点の指定と校正モード")
+    saved, graded = [], []
+    base = {
+        "fetch_rubric_tabs": lambda: TABS,
+        "get_ai_user": lambda: 10,
+        "list_assignments": lambda cid: [{"id": 11, "cmid": 21, "name": "事前課題3：記事"}],
+        "list_pending": lambda aid: [],
+        "list_human_graded": lambda aid, me: [{"userid": 5, "human_grade": 19.0, "grader": 654}],
+        "get_guide_criteria": lambda cmid: guide(15, 15),
+        "get_submission": lambda aid, uid: {"onlinetext": "log", "files": [], "file_text": "本文",
+                                            "unreadable": [], "images": []},
+        "grade_submission": lambda *a, **k: (graded.append(1) or
+                                             {"deductions": [], "feedback": {}, "closing": "",
+                                              "confidence": "high", "needs_human_review": False}),
+        "save_grade_draft": lambda aid, uid, cid, fb, **k: saved.append(uid),
+    }
+    _run_main(base, ALLOW_WRITE=True, WRITE_COURSES={"900"}, GRADE_COURSE_IDS=["900"],
+              REGRADE_TARGETS={(11, 5)}, CALIBRATE=False)
+    check(not graded and not saved, "書き込みありのときは再採点の指定を無視する（採点済みを書き換えない）")
+    _run_main(base, ALLOW_WRITE=False, WRITE_COURSES={"900"}, GRADE_COURSE_IDS=["900"],
+              REGRADE_TARGETS=set(), CALIBRATE=True)
+    check(len(graded) == 1 and not saved, "校正モードは人の採点済みを AI でも採点し、保存はしない")
+
+
 if __name__ == "__main__":
     test_parse()
     test_hold()
@@ -181,5 +252,7 @@ if __name__ == "__main__":
     test_validate()
     test_render()
     test_main_holds()
+    test_never_overwrite()
+    test_regrade_and_calibrate()
     print(f"\n{'FAILED: ' + str(len(FAILED)) if FAILED else 'all passed'}")
     sys.exit(1 if FAILED else 0)
