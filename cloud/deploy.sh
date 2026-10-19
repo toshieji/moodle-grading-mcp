@@ -23,7 +23,6 @@ GRADE_COURSE_IDS="${GRADE_COURSE_IDS:-798,796}"
 MOODLE_WRITE_COURSE_ALLOWLIST="${MOODLE_WRITE_COURSE_ALLOWLIST:-798,796}"
 MOODLE_ALLOW_WRITE="${MOODLE_ALLOW_WRITE:-1}"
 RUBRIC_SHEET_ID="${RUBRIC_SHEET_ID:-1bpQvKMMxQtjmn3ruhuVR8UNQAhQuWnMQMIUm21E6zv0}"
-RUBRIC_SHEET_GID="${RUBRIC_SHEET_GID:-1694745353}"
 GRADING_MODEL="${GRADING_MODEL:-claude-haiku-4-5-20251001}"
 
 echo "== 1. サービスアカウント作成（既存ならスキップ） =="
@@ -61,7 +60,7 @@ gcloud artifacts repositories describe moodle-grading --project "$PROJECT" --loc
   gcloud artifacts repositories create moodle-grading --project "$PROJECT" --location "$REGION" --repository-format=docker
 # extract.py はリポジトリ直下（MCP サーバと共用）にあるため、cloud/ と合わせた一時ディレクトリでビルドする。
 BUILD_DIR="$(mktemp -d)"
-cp "$HERE"/Dockerfile "$HERE"/requirements.txt "$HERE"/grading_job.py "$HERE"/ai-usage-log-rubric.md "$BUILD_DIR"/
+cp "$HERE"/Dockerfile "$HERE"/requirements.txt "$HERE"/grading_job.py "$HERE"/rubric.py "$HERE"/instructor_notes.json "$BUILD_DIR"/
 cp "$HERE"/../extract.py "$BUILD_DIR"/
 gcloud builds submit "$BUILD_DIR" --project "$PROJECT" --tag "$IMAGE"
 rm -rf "$BUILD_DIR"
@@ -77,7 +76,6 @@ GRADE_COURSE_IDS: "${GRADE_COURSE_IDS}"
 MOODLE_WRITE_COURSE_ALLOWLIST: "${MOODLE_WRITE_COURSE_ALLOWLIST}"
 MOODLE_ALLOW_WRITE: "${MOODLE_ALLOW_WRITE}"
 RUBRIC_SHEET_ID: "${RUBRIC_SHEET_ID}"
-RUBRIC_SHEET_GID: "${RUBRIC_SHEET_GID}"
 GRADING_MODEL: "${GRADING_MODEL}"
 EOF
 
