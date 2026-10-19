@@ -82,6 +82,32 @@ def test_scores() -> None:
     check(rb.unit_of(r21, shared) == 20, "全体で1回判定の減点は按分しない（講師は 2-1 でも −10 をそのまま引いている）")
 
 
+def test_decision1_shared_only_in_2_3() -> None:
+    """2026-10-19 決定事項1: 事前課題2全体の「AI使用ログの質」は 2-3 だけで引く。2行を統合し一律 −10。"""
+    print("決定事項1（AI使用ログの質は 2-3 で一律）")
+    import copy
+    tabs = copy.deepcopy(TABS)
+    rows = tabs["事前課題2（事業分析）"]
+    i = next(k for k, r in enumerate(rows) if r and str(r[0]).startswith("AI使用ログの質（事前課題2 全体で1回判定"))
+    rows[i][0] = "AI使用ログの質（事前課題2 全体で1回判定・減点のみ・事前課題2-3の「AI使用ログ」で減点）"
+    j = next(k for k in range(i, i + 8) if len(rows[k]) > 1 and str(rows[k][1]).startswith("修正種類の自己申告"))
+    rows[j][1] = "修正種類の自己申告と記載された修正内容が一致しない、または、AI使用ログに記載された修正が提出物に反映されていない：事前課題2全体で1つでもあれば一律（両方に当てはまっても1回）"
+    k = next(k for k in range(i, i + 8) if len(rows[k]) > 1 and str(rows[k][1]).startswith("AI使用ログに記載された修正"))
+    del rows[k]
+
+    def RR(name, c, a):
+        r, _, hold = gj.rubric_for(name, tabs, guide(c, a))
+        assert not hold, hold
+        return r
+    r21, r22, r23 = RR("事前課題2-1：事業分析", 25, 25), RR("事前課題2-2：ユーザー分析", 12, 12), RR("事前課題2-3：ロジックツリー", 13, 13)
+    check(not any(s.shared for s in r21.sections) and not any(s.shared for s in r22.sections),
+          "2-1・2-2 には事前課題2全体の減点を出さない")
+    check(any(s.shared for s in r23.sections), "2-3 には事前課題2全体の減点を出す")
+    flat = next(i for i in r23.items() if "一律" in i.text)
+    sc = rb.compute_scores(r23, [{"item_id": flat.id, "count": 3}])
+    check(sc["ai"] == 3, "「一律」は何件あっても1回だけ −10（13 → 3）")
+
+
 def test_validate() -> None:
     print("モデル出力の検証")
     r = R("事前課題3：ナレッジ記事", 15, 15)
@@ -256,6 +282,7 @@ if __name__ == "__main__":
     test_parse()
     test_hold()
     test_scores()
+    test_decision1_shared_only_in_2_3()
     test_validate()
     test_render()
     test_main_holds()

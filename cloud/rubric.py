@@ -37,6 +37,9 @@ class Section:
     items: list[Item] = field(default_factory=list)
     part: str | None = None      # 事前課題2-1 など（小計行で区切られたタブのみ）
     shared: bool = False         # 「全体で1回判定」の減点（複数の課題に按分する）
+    # shared のうち、減点する課題が決まっているもの（例: 事前課題2-3。2026-10-19 決定事項1）。
+    # 節名の「（…事前課題2-3の「AI使用ログ」で減点）」から読む。None なら全課題で引ける（従来）
+    apply_part: str | None = None
 
 
 @dataclass
@@ -115,8 +118,10 @@ def parse_tab(rows: list[list], tab: str) -> list[Section]:
             cur.items.append(Item(id=f"r{r}", text=b, unit=-cv, section=cur.key))
             continue
         if a and cv is not None and cv >= 0 and not a.isdigit():
-            cur = Section(key=f"s{r}", name=a, kind=kind, max=cv,
-                          shared=(kind == AI and "全体で1回" in a))
+            shared = kind == AI and "全体で1回" in a
+            m_ap = re.search(r"(事前課題\d-\d)の「AI使用ログ」で減点", a) if shared else None
+            cur = Section(key=f"s{r}", name=a, kind=kind, max=cv, shared=shared,
+                          apply_part=m_ap.group(1) if m_ap else None)
             sections.append(cur)
             if kind == CONTENT:
                 pending_part.append(cur)
@@ -143,7 +148,8 @@ def build_rubric(key: str, tab: str, rows: list[list], part: str | None = None) 
         all_labels = [_label(s.name) for s in sections if s.kind == CONTENT]
         labels = {_label(s.name) for s in content if all_labels.count(_label(s.name)) == 1}
         ai = [s for s in sections if s.kind == AI and
-              (s.shared or _norm(s.name) in names or _label(s.name) in labels)]
+              ((s.shared and (s.apply_part is None or s.apply_part == part))
+               or _norm(s.name) in names or _label(s.name) in labels)]
         sections = content + ai
     ids = {i.id for s in sections for i in s.items}
     assert len(ids) == sum(len(s.items) for s in sections)
@@ -169,7 +175,9 @@ def compute_scores(rubric: Rubric, deductions: list[dict]) -> dict:
     by_item: dict[str, float] = {}
     for d in deductions:
         it = rubric.item(d["item_id"])
-        pts = unit_of(rubric, it) * int(d.get("count") or 1)
+        # 「一律」の項目は何件あっても1回だけ引く（2026-10-19 決定事項1）
+        count = 1 if "一律" in it.text else int(d.get("count") or 1)
+        pts = unit_of(rubric, it) * count
         by_item[it.id] = by_item.get(it.id, 0) + pts
         lost[it.section] = lost.get(it.section, 0) + pts
     out = {CONTENT: 0.0, AI: 0.0}
