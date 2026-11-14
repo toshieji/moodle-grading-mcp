@@ -483,7 +483,7 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                             "quote": {"type": "string",
                                       "description": "根拠となる提出物の記述をそのまま40字以内で引用"},
                             "location": {"type": "string",
-                                         "description": "引用元（例：企画レポート.pptx スライド3、AI使用ログ 節目2）"},
+                                         "description": "引用元（例：企画レポート.pptx スライド3、AI使用ログ 3件目の修正）"},
                         },
                         "required": ["item_id", "count", "reason", "quote", "location", "certain"],
                     },
@@ -499,7 +499,7 @@ def build_grade_tool(rubric: rb.Rubric) -> dict:
                             "item_id": {"type": "string", "enum": ai_ids},
                             "verdict": {"type": "string", "enum": ["該当", "非該当"]},
                             "evidence": {"type": "string",
-                                         "description": "判断の根拠（どの節目・どの記述を確認したか）を1文で"},
+                                         "description": "判断の根拠（ログのどの記述を確認したか）を1文で"},
                         },
                         "required": ["item_id", "verdict", "evidence"],
                     },
@@ -613,7 +613,7 @@ def _system(rubric: rb.Rubric, stance: str = "") -> str:
         "- 回答内容の項目は提出ファイルの本文を根拠にする。AI使用ログの項目は、オンラインテキストのAI使用ログを根拠にする。\n"
         "- 減点項目への該当判断が割れるとき、機密配慮違反の疑いがあるときは needs_human_review=true にする。\n\n"
         "【AI使用ログの確認手順（全項目を ai_checks に記録する）】\n"
-        "- 節目（AIを使った作業の区切り）ごとに、次を確認する。\n"
+        "- AI使用ログ全体を、課題1つ分としてまとめて確認する（作業の区切りごとに分けて数えない）。\n"
         "  (a) プロンプトの要約だけでなく、AIの出力の要約も記録されているか（無ければ「会話ログ（要約可）が提出されていない」に該当）\n"
         "  (b) 外部追加ごとに、いつ・どこで・何にもとづくかが書かれ、その記録で主張を裏付けられるか。"
         "「以前は〜だった」など変化を主張しているのに、変化前の記録が無い場合は、出所を特定できない外部追加として扱う\n"
