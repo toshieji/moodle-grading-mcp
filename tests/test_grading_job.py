@@ -122,15 +122,18 @@ def test_main_skips_unreadable() -> None:
             "images": []},
         2: {"onlinetext": "log", "files": ["b.pptx"], "file_text": "本文", "unreadable": [], "images": []},
     }
+    import json
+    tabs = json.load(open(os.path.join(ROOT, "tests", "fixtures", "rubric_260828.json"), encoding="utf-8"))
     patches = {
-        "fetch_rubric_sheet_text": lambda: "rubric",
-        "load_ai_usage_rubric": lambda: "ai rubric",
+        "fetch_rubric_tabs": lambda: tabs,
+        "get_ai_user": lambda: 10,
         "list_assignments": lambda cid: [{"id": 10, "cmid": 20, "name": "事前課題3", "grademax": 30}],
         "list_pending": lambda aid: [{"userid": 1}, {"userid": 2}],
-        "get_guide_criteria": lambda cmid: None,
+        "get_guide_criteria": lambda cmid: [{"id": 1, "name": "内容（15点）", "maxscore": 15},
+                                             {"id": 2, "name": "AI使用ログ（15点）", "maxscore": 15}],
         "get_submission": lambda aid, uid: subs[uid],
         "grade_submission": lambda *a, **k: (graded_calls.append(1) or
-                                             {"grade": 20, "feedback_html": "<p>x</p>",
+                                             {"deductions": [], "feedback": {}, "closing": "",
                                               "confidence": "high", "needs_human_review": False}),
         "save_grade_draft": lambda aid, uid, *a, **k: saved.append(uid),
     }
@@ -146,21 +149,26 @@ def test_main_skips_unreadable() -> None:
     check(saved == [2], "読めない提出（user 1）は保存されず、読める提出（user 2）だけ保存される")
     check(len(graded_calls) == 1, "読めない提出は採点モデルを呼ばない")
 
-    # 再採点の指定: 採点済み（pending に出ない）user 3 を指定すると採点し直す。指定外の課題は触らない
+    # 再採点の指定は書き込みなしのときだけ有効。採点済みの提出を書き換えない（2026-10-03 江尻指示）
     subs[3] = subs[2]
     saved.clear()
+    graded_calls.clear()
     patches["list_pending"] = lambda aid: []
-    orig_targets = gj.REGRADE_TARGETS
-    gj.REGRADE_TARGETS = {(10, 3), (99, 4)}
-    for k, v in patches.items():
-        setattr(gj, k, v)
-    try:
-        gj.main()
-    finally:
-        gj.REGRADE_TARGETS = orig_targets
-        for k, v in originals.items():
+    orig = (gj.REGRADE_TARGETS, gj.ALLOW_WRITE)
+    for allow, label in ((True, "書き込みあり"), (False, "書き込みなし")):
+        gj.REGRADE_TARGETS, gj.ALLOW_WRITE = {(10, 3), (99, 4)}, allow
+        for k, v in patches.items():
             setattr(gj, k, v)
-    check(saved == [3], "REGRADE_TARGETS で指定した採点済みの提出だけを採点し直す")
+        try:
+            gj.main()
+        finally:
+            for k, v in originals.items():
+                setattr(gj, k, v)
+        if allow:
+            check(not graded_calls and not saved, "書き込みありでは再採点の指定を無視する")
+        else:
+            check(len(graded_calls) == 1 and not saved, "書き込みなしなら指定した提出を採点するが保存しない")
+    gj.REGRADE_TARGETS, gj.ALLOW_WRITE = orig
 
 
 if __name__ == "__main__":
